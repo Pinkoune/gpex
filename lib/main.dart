@@ -472,7 +472,7 @@ class _CarteScreenState extends State<CarteScreen> {
   // --- RECHARGE ÉLECTRIQUE ---
   Future<void> chargerBornes() async {
     final url = Uri.parse(
-      "https://odre.opendatasoft.com/api/explore/v2.1/catalog/datasets/bornes-irve/records?where=within_distance(coordonneesXY, geom'POINT(${maPosition.longitude} ${maPosition.latitude})', 15km)&limit=100",
+      "https://odre.opendatasoft.com/api/explore/v2.1/catalog/datasets/bornes-irve/records?where=within_distance(coordonneesxy, geom'POINT(${maPosition.longitude} ${maPosition.latitude})', 15km)&limit=100",
     );
     try {
       final reponse = await http.get(url);
@@ -490,8 +490,14 @@ class _CarteScreenState extends State<CarteScreen> {
     setState(() {
       markersBornes = dataBornes
           .map((borne) {
-            final double? lat = borne['coordonneesxy']?['lat'];
-            final double? lon = borne['coordonneesxy']?['lon'];
+            // Note: In ODRE API, `coordonneesxy` object has lon/lat keys often mapped correctly or swapped depending on the dataset version.
+            // But we actually have `consolidated_latitude` and `consolidated_longitude` which are safer.
+            final double? lat =
+                borne['consolidated_latitude'] ??
+                borne['coordonneesxy']?['lat'];
+            final double? lon =
+                borne['consolidated_longitude'] ??
+                borne['coordonneesxy']?['lon'];
 
             if (lat == null || lon == null) return null;
 
