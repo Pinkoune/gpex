@@ -28,5 +28,7 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSLocationUsageDescription</key>
+	<string>L'application a besoin de votre position pour afficher la carte et les POIs autour de vous.</string>
 </dict>
 </plist>
