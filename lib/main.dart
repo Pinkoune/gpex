@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:ui'; // Pour le BackdropFilter (Glassmorphism)
 import 'package:geolocator/geolocator.dart';
+import 'dart:math';
 
 void main() {
   runApp(const MonGPSRadarApp());
@@ -31,7 +32,7 @@ class CarteScreen extends StatefulWidget {
   State<CarteScreen> createState() => _CarteScreenState();
 }
 
-class _CarteScreenState extends State<CarteScreen> {
+class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin {
   final MapController _mapController = MapController();
   bool _estCartePrete = false; // Flag pour s'assurer que la carte est prête
   LatLng maPosition = const LatLng(43.6046, 1.4442);
@@ -42,6 +43,19 @@ class _CarteScreenState extends State<CarteScreen> {
   LatLng? destination; // Le point d'arrivée
   bool modeNavigation = false; // Mode GPS Waze-like activé
   double vitesseKmh = 0.0; // Vitesse du véhicule
+  double vitesseLimiteCible = 0.0; // Vitesse réglementée max
+  List<int> pointsSpeedLimit = []; // Limitations par Shape Index
+
+  // --- ANIMATIONS MAP ---
+  AnimationController? _animController;
+  Animation<double>? _zoomAnim;
+  Animation<double>? _rotAnim;
+  Animation<LatLng>? _centerAnim;
+  
+  double radarProcheDistance = double.infinity; // Radar info
+
+
+
 
   // Aperçu du trajet (Google Maps style)
   bool modeApercuTrajet = false;
@@ -80,6 +94,7 @@ class _CarteScreenState extends State<CarteScreen> {
   void dispose() {
     _searchController.dispose();
     _searchFocus.dispose();
+    _animController?.dispose();
     super.dispose();
   }
 
@@ -95,8 +110,8 @@ class _CarteScreenState extends State<CarteScreen> {
     // (Ainsi, même si getCurrentPosition bloque, le suivi est armé)
     Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 10,
+        accuracy: LocationAccuracy.bestForNavigation, // Précision maximale !
+        distanceFilter: 2, // Pour plus de fluidité, filter à 2m
       ),
     ).listen((Position position) {
       if (!mounted) return;
@@ -108,18 +123,113 @@ class _CarteScreenState extends State<CarteScreen> {
 
       if (_estCartePrete) {
         if (modeNavigation) {
-          _mapController.move(maPosition, 18.0);
-          if (position.heading > 0) {
-            _mapController.rotate(360 - position.heading);
+          // Calcul Zoom Dynamique : à 0-20km/h => zoom 18. à >80km/h => zoom 16
+          double targetZoom = 18.0;
+          if (vitesseKmh > 80) {
+            targetZoom = 15.5;
+          } else if (vitesseKmh > 40) {
+            targetZoom = 16.5;
           }
+          
+          double targetRot = position.heading > 0 ? (360 - position.heading) : 0.0;
+
+          
+          // Aligner virtuellement le véhicule en bas. 
+          // (Décaler le LatLng cible vers le HAUT pour compenser)
+          // Approximation basique proportionnelle au zoom.
+          double offsetLat = (0.0005 * (18.0 / targetZoom)) * cos(position.heading * pi / 180);
+          double offsetLng = (0.0005 * (18.0 / targetZoom)) * sin(position.heading * pi / 180);
+          LatLng targetCenter = LatLng(maPosition.latitude + offsetLat, maPosition.longitude + offsetLng);
+
+          _animerCarte(targetCenter, targetZoom, targetRot);
         } else {
-          _mapController.move(maPosition, 15.0);
-          _mapController.rotate(0.0);
+          // _mapController.move(maPosition, 15.0); // Simple centrage sans rotation fixe
         }
       }
       chargerRadars();
-      if (destination != null) {
-        calculerRoute(maPosition, destination!, transportMode);
+      
+      // Radar Alert Logic
+      double minDistRadar = double.infinity;
+      if (modeNavigation && gpsActif && mesRadars.isNotEmpty) {
+        for (var marker in mesRadars) {
+          double dist = Geolocator.distanceBetween(
+              position.latitude, position.longitude,
+              marker.point.latitude, marker.point.longitude);
+          
+          if (dist <= 800) { // Afficher jusqu'à 800m
+             double bearing = Geolocator.bearingBetween(
+                position.latitude, position.longitude,
+                marker.point.latitude, marker.point.longitude);
+             double angleDiff = (bearing - position.heading).abs();
+             if (angleDiff > 180) angleDiff = 360 - angleDiff;
+             if (angleDiff <= 60) {
+               if (dist < minDistRadar) minDistRadar = dist;
+             }
+          }
+        }
+      }
+      setState(() {
+        radarProcheDistance = minDistRadar;
+      });
+
+      if (destination != null && pointsItineraire.isNotEmpty && modeNavigation) {
+        // --- REAL TIME ETA / RECALCULATION ---
+        double minDistanceToRoute = double.infinity;
+        int minIndex = -1;
+
+        // Trouver le point le plus proche sur le tracé restant (pour performance, on chercherait mieux)
+        for (int i = 0; i < pointsItineraire.length; i++) {
+          double dist = Geolocator.distanceBetween(
+              position.latitude, position.longitude,
+              pointsItineraire[i].latitude, pointsItineraire[i].longitude);
+          if (dist < minDistanceToRoute) {
+            minDistanceToRoute = dist;
+            minIndex = i;
+          }
+        }
+
+        if (minDistanceToRoute > 100) { // Déviation > 100m = recalcul route
+             debugPrint("🚩 Déviation détectée ($minDistanceToRoute m). Recalcul de l'itinéraire !");
+             pointsItineraire.clear();
+             pointsSpeedLimit.clear();
+             calculerRoute(maPosition, destination!, transportMode);
+        } else if (minIndex != -1) {
+            // Update Speed Limit Target
+            double newLimit = 0.0;
+            if (minIndex < pointsSpeedLimit.length) {
+              newLimit = pointsSpeedLimit[minIndex].toDouble();
+            }
+
+            // Distance restante approximative en cumulant les segments suivants
+            double distLeftMeters = 0;
+            for (int i = minIndex; i < pointsItineraire.length - 1; i++) {
+                distLeftMeters += Geolocator.distanceBetween(
+                     pointsItineraire[i].latitude, pointsItineraire[i].longitude,
+                     pointsItineraire[i+1].latitude, pointsItineraire[i+1].longitude,
+                );
+            }
+            
+            // ETA Basé sur Vitesse Valhalla ou Standard => Moyenne 50 km/h urbain = 13.8 m/s
+            double speedMs = vitesseKmh > 0 ? position.speed : 13.8; 
+            if(speedMs < 5.0 && transportMode == 'auto') speedMs = 13.8; // default to avoid infinite ETA at stop
+            
+            int secondsLeft = (distLeftMeters / speedMs).round();
+            int hours = secondsLeft ~/ 3600;
+            int mins = (secondsLeft % 3600) ~/ 60;
+
+            String newEta = hours > 0 ? "$hours h ${mins.toString().padLeft(2, '0')} min" : "$mins min";
+            String newDist = distLeftMeters > 1000 
+                ? "${(distLeftMeters / 1000).toStringAsFixed(1)} km" 
+                : "${distLeftMeters.round()} m";
+
+            if (newEta != etaTextApercu || newDist != distanceTextApercu || newLimit != vitesseLimiteCible) {
+               setState(() {
+                 etaTextApercu = newEta;
+                 distanceTextApercu = newDist; // Update Panel
+                 vitesseLimiteCible = newLimit;
+               });
+            }
+        }
       }
     });
 
@@ -168,6 +278,78 @@ class _CarteScreenState extends State<CarteScreen> {
     } catch (e) {
       debugPrint("Timeout ou erreur surGetCurrentPosition initiale: $e");
     }
+  }
+
+  void _animerCarte(LatLng cible, double destZoom, double destRot) {
+    _animController?.dispose();
+    _animController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000), // Smooth 1 sec
+    );
+
+    final LatLng startX = _mapController.camera.center;
+    final double startZ = _mapController.camera.zoom;
+    final double startR = _mapController.camera.rotation;
+
+    // Normalisation Rotation target to nearest 360 loop to avoid spin-around
+    double shortRot = destRot;
+    if ((destRot - startR).abs() > 180) {
+      if (destRot > startR) {
+        shortRot -= 360;
+      } else {
+        shortRot += 360;
+      }
+    }
+
+    _centerAnim = LatLngTween(begin: startX, end: cible).animate(CurvedAnimation(parent: _animController!, curve: Curves.easeOut));
+    _zoomAnim = Tween<double>(begin: startZ, end: destZoom).animate(CurvedAnimation(parent: _animController!, curve: Curves.easeOut));
+    _rotAnim = Tween<double>(begin: startR, end: shortRot).animate(CurvedAnimation(parent: _animController!, curve: Curves.easeOut));
+
+    _animController!.addListener(() {
+      _mapController.move(_centerAnim!.value, _zoomAnim!.value);
+      _mapController.rotate(_rotAnim!.value);
+    });
+
+    _animController!.forward();
+  }
+
+  // --- TRAFFIC MOCK (APPLE MAPS STYLE) ---
+  List<Polyline> _buildTrafficPolylines() {
+    if (pointsItineraire.isEmpty) return [];
+
+    List<Polyline> lines = [];
+    // Bordure (contour) blanc pour le style Apple Maps
+    lines.add(Polyline(
+      points: pointsItineraire,
+      color: Colors.white,
+      strokeWidth: 10.0,
+      strokeCap: StrokeCap.round,
+      strokeJoin: StrokeJoin.round,
+    ));
+
+    // Si le trajet est extrêmement court, juste le bleu
+    if (pointsItineraire.length < 10) {
+      lines.add(Polyline(
+        points: pointsItineraire,
+        color: const Color(0xFF007AFF),
+        strokeWidth: 6.0,
+        strokeCap: StrokeCap.round,
+        strokeJoin: StrokeJoin.round,
+      ));
+      return lines;
+    }
+
+    // Découpage Mock: 10% Bleu, 15% Orange, 15% Rouge, reste Bleu
+    int i1 = (pointsItineraire.length * 0.1).round();
+    int i2 = (pointsItineraire.length * 0.25).round();
+    int i3 = (pointsItineraire.length * 0.40).round();
+
+    lines.add(Polyline(points: pointsItineraire.sublist(0, i1 + 1), color: const Color(0xFF007AFF), strokeWidth: 6.0, strokeJoin: StrokeJoin.round, strokeCap: StrokeCap.round));
+    lines.add(Polyline(points: pointsItineraire.sublist(i1, i2 + 1), color: const Color(0xFFFF9500), strokeWidth: 6.0, strokeJoin: StrokeJoin.round, strokeCap: StrokeCap.round));
+    lines.add(Polyline(points: pointsItineraire.sublist(i2, i3 + 1), color: const Color(0xFFFF3B30), strokeWidth: 6.0, strokeJoin: StrokeJoin.round, strokeCap: StrokeCap.round));
+    lines.add(Polyline(points: pointsItineraire.sublist(i3, pointsItineraire.length), color: const Color(0xFF007AFF), strokeWidth: 6.0, strokeJoin: StrokeJoin.round, strokeCap: StrokeCap.round));
+
+    return lines;
   }
 
   // --- SUGGESTIONS TEMPS RÉEL ---
@@ -306,9 +488,29 @@ class _CarteScreenState extends State<CarteScreen> {
         final mins = (timeFormatter % 3600) ~/ 60;
 
         List<LatLng> result = _decodeValhallaPolyline(shape);
+        List<int> speeds = List.filled(result.length, 0);
+        
+        // Extraction des speed_limits des maneuvers
+        try {
+          final maneuvers = data['trip']['legs'][0]['maneuvers'] as List;
+          for(var m in maneuvers) {
+            int begin = m['begin_shape_index'] ?? 0;
+            int end = m['end_shape_index'] ?? 0;
+            dynamic spd = m['speed_limit'];
+            
+            if (spd != null && spd is num && spd > 0) {
+               for(int i = begin; i <= end; i++) {
+                 if (i < speeds.length) speeds[i] = spd.toInt();
+               }
+            }
+          }
+        } catch(e) {
+          debugPrint("Erreur SpeedLimits Extract: $e");
+        }
 
         setState(() {
           pointsItineraire = result;
+          pointsSpeedLimit = speeds;
           distanceTextApercu = "${length.toStringAsFixed(1)} km";
           etaTextApercu = hours > 0
               ? "$hours h ${mins.toString().padLeft(2, '0')} min"
@@ -841,22 +1043,7 @@ class _CarteScreenState extends State<CarteScreen> {
                 userAgentPackageName: 'com.jeremy.gps',
               ),
               PolylineLayer(
-                polylines: [
-                  if (pointsItineraire.isNotEmpty) ...[
-                    // Bordure (contour) blanc
-                    Polyline(
-                      points: pointsItineraire,
-                      color: Colors.white,
-                      strokeWidth: 10.0,
-                    ),
-                    // Ligne principale bleue
-                    Polyline(
-                      points: pointsItineraire,
-                      color: const Color(0xFF007AFF), // Bleu dynamique iOS/Waze
-                      strokeWidth: 6.0,
-                    ),
-                  ],
-                ],
+                polylines: _buildTrafficPolylines(),
               ),
               MarkerLayer(markers: mesRadars),
               if (afficherEssence) MarkerLayer(markers: markersEssence),
@@ -1223,6 +1410,60 @@ class _CarteScreenState extends State<CarteScreen> {
               ),
             ),
 
+          // ── ALERTE RADAR PROXIMITÉ (Style Float) ────────────
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 400),
+            curve: Curves.easeOutBack,
+            top: radarProcheDistance != double.infinity ? 60 : -120, // Animé depuis le haut
+            left: 20,
+            right: 20,
+            child: Material(
+              color: Colors.transparent,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFFFF3B30), Color(0xFFFF453A)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.redAccent.withValues(alpha: 0.5),
+                      blurRadius: 15,
+                      offset: const Offset(0, 6),
+                    ),
+                  ],
+                  border: Border.all(color: Colors.white.withValues(alpha: 0.2), width: 1.5),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 36),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            "Zone de Danger",
+                            style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                          ),
+                          Text(
+                            radarProcheDistance != double.infinity 
+                                ? "Radar à ${radarProcheDistance.round()} m" 
+                                : "",
+                            style: const TextStyle(color: Colors.white70, fontSize: 14, fontWeight: FontWeight.w500),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
           // ── PANNEAU DIRECTIONS HAUT (Style Waze Glassmorphism) ────────────
           if (modeNavigation)
             Positioned(
@@ -1308,45 +1549,91 @@ class _CarteScreenState extends State<CarteScreen> {
             Positioned(
               bottom: 130, // Juste au-dessus du panneau ETA
               left: 16,
-              child: Container(
-                width: 65,
-                height: 65,
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  shape: BoxShape.circle,
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.2),
-                      blurRadius: 10,
-                      offset: const Offset(0, 5),
+              child: Row(
+                children: [
+                  // Compteur
+                  Container(
+                    width: 65,
+                    height: 65,
+                    decoration: BoxDecoration(
+                      color: (vitesseLimiteCible > 0 && vitesseKmh > vitesseLimiteCible + 5) 
+                          ? Colors.redAccent.shade100 
+                          : Colors.white,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.2),
+                          blurRadius: 10,
+                          offset: const Offset(0, 5),
+                        ),
+                      ],
+                      border: Border.all(
+                        color: (vitesseLimiteCible > 0 && vitesseKmh > vitesseLimiteCible + 5)
+                            ? Colors.redAccent.shade700
+                            : Colors.grey.shade300, 
+                        width: 3
+                      ),
                     ),
-                  ],
-                  border: Border.all(color: Colors.grey.shade300, width: 3),
-                ),
-                child: Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        vitesseKmh.round().toString(),
-                        style: const TextStyle(
-                          color: Colors.black,
-                          fontSize: 24,
-                          fontWeight: FontWeight.w900,
-                          height: 1.0,
-                        ),
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            vitesseKmh.round().toString(),
+                            style: TextStyle(
+                              color: (vitesseLimiteCible > 0 && vitesseKmh > vitesseLimiteCible + 5) 
+                                  ? Colors.red.shade900 
+                                  : Colors.black,
+                              fontSize: 24,
+                              fontWeight: FontWeight.w900,
+                              height: 1.0,
+                            ),
+                          ),
+                          Text(
+                            "km/h",
+                            style: TextStyle(
+                              color: (vitesseLimiteCible > 0 && vitesseKmh > vitesseLimiteCible + 5) 
+                                  ? Colors.red.shade800 
+                                  : Colors.black54,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
                       ),
-                      const Text(
-                        "km/h",
-                        style: TextStyle(
-                          color: Colors.black54,
-                          fontSize: 10,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
+                    ),
                   ),
-                ),
+                  const SizedBox(width: 8),
+
+                  // Panneau Speed Limit Européen
+                  if (vitesseLimiteCible > 0)
+                    Container(
+                      width: 55,
+                      height: 55,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.redAccent.shade700, width: 6),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.2),
+                            blurRadius: 8,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Center(
+                        child: Text(
+                          vitesseLimiteCible.round().toString(),
+                          style: const TextStyle(
+                            color: Colors.black,
+                            fontSize: 18,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
 
