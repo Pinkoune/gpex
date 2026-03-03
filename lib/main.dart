@@ -3,6 +3,7 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'dart:ui'; // Pour le BackdropFilter (Glassmorphism)
 import 'package:geolocator/geolocator.dart';
 
 void main() {
@@ -32,12 +33,21 @@ class CarteScreen extends StatefulWidget {
 
 class _CarteScreenState extends State<CarteScreen> {
   final MapController _mapController = MapController();
+  bool _estCartePrete = false; // Flag pour s'assurer que la carte est prête
   LatLng maPosition = const LatLng(43.6046, 1.4442);
   List<Marker> mesRadars = [];
   bool gpsActif = false;
   // --- NOUVELLES VARIABLES ---
   List<LatLng> pointsItineraire = []; // La ligne bleue
   LatLng? destination; // Le point d'arrivée
+  bool modeNavigation = false; // Mode GPS Waze-like activé
+  double vitesseKmh = 0.0; // Vitesse du véhicule
+
+  // Aperçu du trajet (Google Maps style)
+  bool modeApercuTrajet = false;
+  String transportMode = 'auto'; // 'auto', 'bicycle', 'pedestrian'
+  String distanceTextApercu = "";
+  String etaTextApercu = "";
 
   bool afficherEssence = false;
   bool afficherParking = false;
@@ -79,25 +89,85 @@ class _CarteScreenState extends State<CarteScreen> {
       permission = await Geolocator.requestPermission();
       if (permission == LocationPermission.denied) return;
     }
+    if (permission == LocationPermission.deniedForever) return;
 
+    // 1. Lancer le stream pour le suivi en temps réel TOUT DE SUITE
+    // (Ainsi, même si getCurrentPosition bloque, le suivi est armé)
     Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
         distanceFilter: 10,
       ),
     ).listen((Position position) {
+      if (!mounted) return;
       setState(() {
         maPosition = LatLng(position.latitude, position.longitude);
+        vitesseKmh = position.speed > 0 ? position.speed * 3.6 : 0.0;
         gpsActif = true;
       });
-      _mapController.move(maPosition, 15.0);
-      chargerRadars();
 
-      // Si on a une destination, on recalcule la route en roulant
+      if (_estCartePrete) {
+        if (modeNavigation) {
+          _mapController.move(maPosition, 18.0);
+          if (position.heading > 0) {
+            _mapController.rotate(360 - position.heading);
+          }
+        } else {
+          _mapController.move(maPosition, 15.0);
+          _mapController.rotate(0.0);
+        }
+      }
+      chargerRadars();
       if (destination != null) {
-        calculerRoute(maPosition, destination!);
+        calculerRoute(maPosition, destination!, transportMode);
       }
     });
+
+    // 2. Tenter d'obtenir la dernière position connue pour un fix ultra-rapide
+    try {
+      Position? knownPosition = await Geolocator.getLastKnownPosition();
+      if (knownPosition != null && mounted) {
+        setState(() {
+          maPosition = LatLng(knownPosition.latitude, knownPosition.longitude);
+          vitesseKmh = knownPosition.speed > 0
+              ? knownPosition.speed * 3.6
+              : 0.0;
+          gpsActif = true;
+        });
+        if (_estCartePrete) {
+          _mapController.move(maPosition, 15.0);
+        }
+      }
+    } catch (_) {}
+
+    // 3. Forcer une position fraîche avec un TIMEOUT
+    // Sans le timeout, getCurrentPosition peut bloquer à l'infini en intérieur sur Android
+    try {
+      Position positionInitiale = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      ).timeout(const Duration(seconds: 5));
+
+      if (mounted) {
+        setState(() {
+          maPosition = LatLng(
+            positionInitiale.latitude,
+            positionInitiale.longitude,
+          );
+          vitesseKmh = positionInitiale.speed > 0
+              ? positionInitiale.speed * 3.6
+              : 0.0;
+          gpsActif = true;
+        });
+        if (_estCartePrete) {
+          _mapController.move(maPosition, 15.0);
+        }
+        chargerRadars();
+      }
+    } catch (e) {
+      debugPrint("Timeout ou erreur surGetCurrentPosition initiale: $e");
+    }
   }
 
   // --- SUGGESTIONS TEMPS RÉEL ---
@@ -130,7 +200,7 @@ class _CarteScreenState extends State<CarteScreen> {
   }
 
   // --- SÉLECTION D'UNE SUGGESTION ---
-  void _selectionnerSuggestion(dynamic feature) {
+  Future<void> _selectionnerSuggestion(dynamic feature) async {
     final coords = feature['geometry']['coordinates'];
     final props = feature['properties'];
     final nom = props['name'] ?? props['city'] ?? 'Destination';
@@ -140,8 +210,14 @@ class _CarteScreenState extends State<CarteScreen> {
       destination = LatLng(coords[1], coords[0]);
       _suggestions = [];
     });
-    calculerRoute(maPosition, destination!);
-    _mapController.move(destination!, 14.0);
+
+    // Attendre le calcul de la route pour qu'elle s'affiche sur la carte globale
+    await calculerRoute(maPosition, destination!, transportMode);
+
+    // On passe en map rotative si et seulement si l'utilisateur clique sur démarrer
+    setState(() {
+      modeApercuTrajet = true;
+    });
   }
 
   // --- FONCTION RECHERCHE (LOOK WAZE) ---
@@ -200,14 +276,18 @@ class _CarteScreenState extends State<CarteScreen> {
   }
 
   // --- FONCTION VALHALLA (L'ITINÉRAIRE) ---
-  Future<void> calculerRoute(LatLng depart, LatLng arrivee) async {
+  Future<void> calculerRoute(
+    LatLng depart,
+    LatLng arrivee,
+    String costing,
+  ) async {
     final url = Uri.parse('https://valhalla.zeusmos.fr/route');
     final corps = json.encode({
       "locations": [
         {"lat": depart.latitude, "lon": depart.longitude},
         {"lat": arrivee.latitude, "lon": arrivee.longitude},
       ],
-      "costing": "auto",
+      "costing": costing,
       "units": "kilometers",
     });
 
@@ -217,17 +297,29 @@ class _CarteScreenState extends State<CarteScreen> {
         final data = json.decode(reponse.body);
         final shape = data['trip']['legs'][0]['shape'];
 
+        // Extraction de la durée et distance pour l'aperçu
+        final summary = data['trip']['summary'];
+        final length = summary['length']; // km
+        final timeFormatter = summary['time']; // secondes
+
+        final hours = timeFormatter ~/ 3600;
+        final mins = (timeFormatter % 3600) ~/ 60;
+
         List<LatLng> result = _decodeValhallaPolyline(shape);
 
         setState(() {
           pointsItineraire = result;
+          distanceTextApercu = "${length.toStringAsFixed(1)} km";
+          etaTextApercu = hours > 0
+              ? "$hours h ${mins.toString().padLeft(2, '0')} min"
+              : "$mins min";
         });
 
-        if (pointsItineraire.isNotEmpty) {
+        if (pointsItineraire.isNotEmpty && !modeNavigation) {
           _mapController.fitCamera(
             CameraFit.bounds(
               bounds: LatLngBounds.fromPoints(pointsItineraire),
-              padding: const EdgeInsets.all(50),
+              padding: const EdgeInsets.all(80),
             ),
           );
         }
@@ -732,7 +824,16 @@ class _CarteScreenState extends State<CarteScreen> {
           // ── CARTE ──────────────────────────────────────────────────────────
           FlutterMap(
             mapController: _mapController,
-            options: MapOptions(initialCenter: maPosition, initialZoom: 15.0),
+            options: MapOptions(
+              initialCenter: maPosition,
+              initialZoom: 15.0,
+              onMapReady: () {
+                _estCartePrete = true;
+                if (gpsActif) {
+                  _mapController.move(maPosition, 15.0);
+                }
+              },
+            ),
             children: [
               TileLayer(
                 urlTemplate:
@@ -741,12 +842,20 @@ class _CarteScreenState extends State<CarteScreen> {
               ),
               PolylineLayer(
                 polylines: [
-                  if (pointsItineraire.isNotEmpty)
+                  if (pointsItineraire.isNotEmpty) ...[
+                    // Bordure (contour) blanc
                     Polyline(
                       points: pointsItineraire,
-                      color: Colors.blueAccent,
-                      strokeWidth: 5.0,
+                      color: Colors.white,
+                      strokeWidth: 10.0,
                     ),
+                    // Ligne principale bleue
+                    Polyline(
+                      points: pointsItineraire,
+                      color: const Color(0xFF007AFF), // Bleu dynamique iOS/Waze
+                      strokeWidth: 6.0,
+                    ),
+                  ],
                 ],
               ),
               MarkerLayer(markers: mesRadars),
@@ -758,13 +867,11 @@ class _CarteScreenState extends State<CarteScreen> {
                 markers: [
                   Marker(
                     point: maPosition,
-                    width: 36,
-                    height: 36,
-                    child: const Icon(
-                      Icons.navigation,
-                      color: Colors.blueAccent,
-                      size: 32,
-                    ),
+                    width: 45,
+                    height: 45,
+                    child: modeNavigation
+                        ? _buildCarMarker()
+                        : _buildBlueDotMarker(),
                   ),
                   if (destination != null)
                     Marker(
@@ -782,113 +889,115 @@ class _CarteScreenState extends State<CarteScreen> {
             ],
           ),
 
-          // ── BARRE DE RECHERCHE + CHIPS ────────────────────────────────────
-          Positioned(
-            top: 0,
-            left: 0,
-            right: 0,
-            child: SafeArea(
-              bottom: false,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Ligne : barre de recherche + bouton localisation
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Container(
-                            height: 50,
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF1C1C1E),
-                              borderRadius: BorderRadius.circular(30),
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.08),
+          // ── BARRE DE RECHERCHE + CHIPS (Cachés si mode navigation) ────────
+          if (!modeNavigation)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: SafeArea(
+                bottom: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Ligne : barre de recherche + bouton localisation
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              height: 50,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1C1C1E),
+                                borderRadius: BorderRadius.circular(30),
+                                border: Border.all(
+                                  color: Colors.white.withValues(alpha: 0.08),
+                                ),
                               ),
-                            ),
-                            child: TextField(
-                              controller: _searchController,
-                              focusNode: _searchFocus,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 15,
-                              ),
-                              decoration: InputDecoration(
-                                hintText: 'Où allez-vous ?',
-                                hintStyle: TextStyle(
-                                  color: Colors.white.withValues(alpha: 0.4),
+                              child: TextField(
+                                controller: _searchController,
+                                focusNode: _searchFocus,
+                                style: const TextStyle(
+                                  color: Colors.white,
                                   fontSize: 15,
                                 ),
-                                prefixIcon: Icon(
-                                  Icons.search,
-                                  color: Colors.white.withValues(alpha: 0.5),
-                                  size: 22,
-                                ),
-                                suffixIcon: _searchController.text.isNotEmpty
-                                    ? GestureDetector(
-                                        onTap: () {
-                                          _searchController.clear();
-                                          _searchFocus.unfocus();
-                                          setState(() {
-                                            _suggestions = [];
-                                            destination = null;
-                                            pointsItineraire = [];
-                                          });
-                                        },
-                                        child: Icon(
-                                          Icons.close,
-                                          color: Colors.white.withValues(
-                                            alpha: 0.5,
+                                decoration: InputDecoration(
+                                  hintText: 'Où allez-vous ?',
+                                  hintStyle: TextStyle(
+                                    color: Colors.white.withValues(alpha: 0.4),
+                                    fontSize: 15,
+                                  ),
+                                  prefixIcon: Icon(
+                                    Icons.search,
+                                    color: Colors.white.withValues(alpha: 0.5),
+                                    size: 22,
+                                  ),
+                                  suffixIcon: _searchController.text.isNotEmpty
+                                      ? GestureDetector(
+                                          onTap: () {
+                                            _searchController.clear();
+                                            _searchFocus.unfocus();
+                                            setState(() {
+                                              _suggestions = [];
+                                              destination = null;
+                                              pointsItineraire = [];
+                                              modeNavigation = false;
+                                              modeApercuTrajet = false;
+                                            });
+                                          },
+                                          child: Icon(
+                                            Icons.close,
+                                            color: Colors.white.withValues(
+                                              alpha: 0.5,
+                                            ),
+                                            size: 20,
                                           ),
-                                          size: 20,
-                                        ),
-                                      )
-                                    : null,
-                                border: InputBorder.none,
-                                contentPadding: const EdgeInsets.symmetric(
-                                  vertical: 14,
+                                        )
+                                      : null,
+                                  border: InputBorder.none,
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    vertical: 14,
+                                  ),
+                                  isDense: true,
                                 ),
-                                isDense: true,
-                              ),
-                              onChanged: (v) {
-                                debugPrint(
-                                  '⌨️ onChanged TextField: "$v" (Focus: ${_searchFocus.hasFocus})',
-                                );
-                                _rechercherSuggestions(v);
-                              },
-                              onSubmitted: (v) {
-                                debugPrint('✅ onSubmitted TextField: "$v"');
-                                _rechercherDestination(v);
-                              },
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        GestureDetector(
-                          onTap: () => _mapController.move(maPosition, 15.0),
-                          child: Container(
-                            width: 50,
-                            height: 50,
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF1C1C1E),
-                              shape: BoxShape.circle,
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.08),
+                                onChanged: (v) {
+                                  debugPrint(
+                                    '⌨️ onChanged TextField: "$v" (Focus: ${_searchFocus.hasFocus})',
+                                  );
+                                  _rechercherSuggestions(v);
+                                },
+                                onSubmitted: (v) {
+                                  debugPrint('✅ onSubmitted TextField: "$v"');
+                                  _rechercherDestination(v);
+                                },
                               ),
                             ),
-                            child: Icon(
-                              Icons.my_location,
-                              color: Colors.blueAccent.withValues(alpha: 0.9),
-                              size: 22,
+                          ),
+                          const SizedBox(width: 10),
+                          GestureDetector(
+                            onTap: () => _mapController.move(maPosition, 15.0),
+                            child: Container(
+                              width: 50,
+                              height: 50,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1C1C1E),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: Colors.white.withValues(alpha: 0.08),
+                                ),
+                              ),
+                              child: Icon(
+                                Icons.my_location,
+                                color: Colors.blueAccent.withValues(alpha: 0.9),
+                                size: 22,
+                              ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-                    // Chips (masquées pendant la recherche active)
-                    if (!_searchFocus.hasFocus) ...[
+                        ],
+                      ),
+                      // Chips
                       const SizedBox(height: 10),
                       SingleChildScrollView(
                         scrollDirection: Axis.horizontal,
@@ -1006,14 +1115,15 @@ class _CarteScreenState extends State<CarteScreen> {
                         ),
                       ),
                     ],
-                  ],
+                  ),
                 ),
               ),
             ),
-          ),
 
           // ── SUGGESTIONS (Positioned séparé pour éviter le clipping) ───────
-          if (_searchFocus.hasFocus && _suggestions.isNotEmpty)
+          if (!modeNavigation &&
+              _searchFocus.hasFocus &&
+              _suggestions.isNotEmpty)
             Positioned(
               top: 80,
               left: 12,
@@ -1112,7 +1222,432 @@ class _CarteScreenState extends State<CarteScreen> {
                 ),
               ),
             ),
+
+          // ── PANNEAU DIRECTIONS HAUT (Style Waze Glassmorphism) ────────────
+          if (modeNavigation)
+            Positioned(
+              top: 50,
+              left: 16,
+              right: 16,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(24),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 16,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1C1C1E).withValues(alpha: 0.85),
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.15),
+                        width: 1,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.3),
+                          blurRadius: 15,
+                          offset: const Offset(0, 8),
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.1),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons
+                                .turn_right, // Direction (statique pour l'instant)
+                            color: Colors.white,
+                            size: 32,
+                          ),
+                        ),
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text(
+                                "Dans 300 m",
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                "Prendre la direction de ${_searchController.text}",
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // ── COMPTEUR DE VITESSE (Style Waze) ────────────
+          if (modeNavigation)
+            Positioned(
+              bottom: 130, // Juste au-dessus du panneau ETA
+              left: 16,
+              child: Container(
+                width: 65,
+                height: 65,
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.2),
+                      blurRadius: 10,
+                      offset: const Offset(0, 5),
+                    ),
+                  ],
+                  border: Border.all(color: Colors.grey.shade300, width: 3),
+                ),
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        vitesseKmh.round().toString(),
+                        style: const TextStyle(
+                          color: Colors.black,
+                          fontSize: 24,
+                          fontWeight: FontWeight.w900,
+                          height: 1.0,
+                        ),
+                      ),
+                      const Text(
+                        "km/h",
+                        style: TextStyle(
+                          color: Colors.black54,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+          // ── PANNEAU TRAJET BAS (Style Waze ETA) ────────────
+          if (modeNavigation && destination != null)
+            Positioned(
+              bottom: 30,
+              left: 16,
+              right: 16,
+              child: Builder(
+                builder: (ctx) {
+                  // On utilise directement les résultats de Valhalla stockés dans les variables "Aperçu"
+                  // qui sont mises à jour par calculerRoute dans la boucle Geolocator.
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 16,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1C1C1E),
+                      borderRadius: BorderRadius.circular(24),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.5),
+                          blurRadius: 20,
+                          offset: const Offset(0, 10),
+                        ),
+                      ],
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.1),
+                        width: 1,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              etaTextApercu.isNotEmpty
+                                  ? etaTextApercu
+                                  : "Calcul...",
+                              style: const TextStyle(
+                                color: Colors.greenAccent,
+                                fontSize: 28,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              distanceTextApercu.isNotEmpty
+                                  ? distanceTextApercu
+                                  : "0 km",
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.7),
+                                fontSize: 16,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ],
+                        ),
+                        GestureDetector(
+                          onTap: () {
+                            setState(() {
+                              modeNavigation = false;
+                              modeApercuTrajet = false;
+                              destination = null;
+                              pointsItineraire = [];
+                              _searchController.clear();
+                            });
+                            _mapController.move(maPosition, 15.0);
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 24,
+                              vertical: 14,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.redAccent.shade700,
+                              borderRadius: BorderRadius.circular(30),
+                            ),
+                            child: const Text(
+                              "Quitter",
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+
+          // ── PANNEAU APERÇU DU TRAJET (Google Maps Style) ────────────
+          if (modeApercuTrajet && !modeNavigation)
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: const EdgeInsets.only(
+                  top: 20,
+                  left: 24,
+                  right: 24,
+                  bottom: 40,
+                ),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF1C1C1E),
+                  borderRadius: BorderRadius.only(
+                    topLeft: Radius.circular(30),
+                    topRight: Radius.circular(30),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black54,
+                      blurRadius: 20,
+                      offset: Offset(0, -5),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Pilule de drag
+                    Container(
+                      width: 40,
+                      height: 5,
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade600,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+
+                    // Sélecteur de mode de transport
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        _boutonTransport(Icons.directions_car, 'auto'),
+                        _boutonTransport(Icons.pedal_bike, 'bicycle'),
+                        _boutonTransport(Icons.directions_walk, 'pedestrian'),
+                      ],
+                    ),
+                    const SizedBox(height: 24),
+
+                    // Informations ETA & Distance
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              etaTextApercu.isNotEmpty
+                                  ? etaTextApercu
+                                  : "Calcul...",
+                              style: const TextStyle(
+                                color: Colors.greenAccent,
+                                fontSize: 32,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              distanceTextApercu.isNotEmpty
+                                  ? "($distanceTextApercu)"
+                                  : "",
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 16,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ],
+                        ),
+                        // Bouton Démarrer
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blueAccent.shade700,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 24,
+                              vertical: 14,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(30),
+                            ),
+                            elevation: 8,
+                          ),
+                          icon: const Icon(Icons.navigation, size: 20),
+                          label: const Text(
+                            "Démarrer",
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          onPressed: () {
+                            setState(() {
+                              modeApercuTrajet = false;
+                              modeNavigation = true;
+                            });
+                            // Zoom et rotation immersifs
+                            _mapController.move(maPosition, 18.0);
+                          },
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
+      ),
+    );
+  }
+
+  // Widget pour les icônes de transport
+  Widget _boutonTransport(IconData icone, String mode) {
+    bool isSelected = (transportMode == mode);
+    return GestureDetector(
+      onTap: () {
+        if (!isSelected) {
+          setState(() {
+            transportMode = mode;
+            etaTextApercu = "Calcul...";
+            distanceTextApercu = "";
+          });
+          if (destination != null) {
+            calculerRoute(maPosition, destination!, transportMode);
+          }
+        }
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+        decoration: BoxDecoration(
+          color: isSelected
+              ? Colors.blueAccent.shade700.withValues(alpha: 0.2)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: isSelected ? Colors.blueAccent.shade700 : Colors.transparent,
+            width: 2,
+          ),
+        ),
+        child: Icon(
+          icone,
+          color: isSelected ? Colors.blueAccent.shade400 : Colors.white54,
+          size: 28,
+        ),
+      ),
+    );
+  }
+
+  // ── CUSTOM MARKERS ────────────────────────────────────────────────────────
+
+  // Marqueur Position Google Maps (Cercle bleu avec bordure blanche et ombre)
+  Widget _buildBlueDotMarker() {
+    return Container(
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: Colors.blueAccent,
+        border: Border.all(color: Colors.white, width: 3),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.blueAccent.withValues(alpha: 0.4),
+            blurRadius: 10,
+            spreadRadius: 4,
+          ),
+          const BoxShadow(
+            color: Colors.black26,
+            blurRadius: 5,
+            offset: Offset(0, 3),
+          ),
+        ],
+      ),
+      margin: const EdgeInsets.all(12),
+    );
+  }
+
+  // Marqueur Voiture de Navigation (Style Waze / 3D)
+  Widget _buildCarMarker() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.blueAccent.shade700, width: 3),
+        boxShadow: const [
+          BoxShadow(color: Colors.black45, blurRadius: 8, offset: Offset(0, 4)),
+        ],
+      ),
+      child: const Center(
+        child: Icon(Icons.directions_car, color: Colors.black87, size: 28),
       ),
     );
   }
