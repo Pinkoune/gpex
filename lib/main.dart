@@ -7,6 +7,15 @@ import 'dart:ui'; // Pour le BackdropFilter (Glassmorphism)
 import 'package:geolocator/geolocator.dart';
 import 'dart:math';
 
+const String tomtomApiKey = "gCm05RjVrOc3Ew1WlUgn9zrbjImAKW9n";
+
+class TrafficSegment {
+  final int startIndex;
+  final int endIndex;
+  final Color color;
+  TrafficSegment(this.startIndex, this.endIndex, this.color);
+}
+
 void main() {
   runApp(const MonGPSRadarApp());
 }
@@ -34,6 +43,7 @@ class CarteScreen extends StatefulWidget {
 
 class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin {
   final MapController _mapController = MapController();
+  String instructionActive = "Suivez l'itinéraire";
   bool _estCartePrete = false; // Flag pour s'assurer que la carte est prête
   LatLng maPosition = const LatLng(43.6046, 1.4442);
   List<Marker> mesRadars = [];
@@ -45,6 +55,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
   double vitesseKmh = 0.0; // Vitesse du véhicule
   double vitesseLimiteCible = 0.0; // Vitesse réglementée max
   List<int> pointsSpeedLimit = []; // Limitations par Shape Index
+  List<TrafficSegment> segmentsTrafic = []; // Segments de couleurs calculés
 
   // --- ANIMATIONS MAP ---
   AnimationController? _animController;
@@ -192,6 +203,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
              debugPrint("🚩 Déviation détectée ($minDistanceToRoute m). Recalcul de l'itinéraire !");
              pointsItineraire.clear();
              pointsSpeedLimit.clear();
+             segmentsTrafic.clear();
              calculerRoute(maPosition, destination!, transportMode);
         } else if (minIndex != -1) {
             // Update Speed Limit Target
@@ -280,6 +292,33 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     }
   }
 
+  Widget _buildBoutonItineraire(LatLng cible, String nom) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 16.0),
+      child: SizedBox(
+        width: double.infinity,
+        child: ElevatedButton.icon(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.blueAccent.shade700,
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          ),
+          icon: const Icon(Icons.navigation, color: Colors.white),
+          label: const Text("Y aller", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          onPressed: () {
+            Navigator.pop(context); // Ferme la petite fenêtre du bas
+            _searchController.text = nom; // Met le nom dans la barre de recherche
+            setState(() {
+              destination = cible;
+              modeApercuTrajet = true; // Ouvre le panneau "Démarrer"
+            });
+            calculerRoute(maPosition, destination!, transportMode);
+          },
+        ),
+      ),
+    );
+  }
+
   void _animerCarte(LatLng cible, double destZoom, double destRot) {
     _animController?.dispose();
     _animController = AnimationController(
@@ -313,41 +352,40 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     _animController!.forward();
   }
 
-  // --- TRAFFIC MOCK (APPLE MAPS STYLE) ---
+  // --- TRAFFIC REEL (TOMTOM) CORRIGÉ ---
   List<Polyline> _buildTrafficPolylines() {
     if (pointsItineraire.isEmpty) return [];
 
     List<Polyline> lines = [];
-    // Bordure (contour) blanc pour le style Apple Maps
-    lines.add(Polyline(
-      points: pointsItineraire,
-      color: Colors.white,
-      strokeWidth: 10.0,
-      strokeCap: StrokeCap.round,
-      strokeJoin: StrokeJoin.round,
-    ));
 
-    // Si le trajet est extrêmement court, juste le bleu
-    if (pointsItineraire.length < 10) {
+    // 1. Fallback si TomTom ne répond pas ou est vide
+    if (segmentsTrafic.isEmpty) {
       lines.add(Polyline(
         points: pointsItineraire,
         color: const Color(0xFF007AFF),
         strokeWidth: 6.0,
+        borderStrokeWidth: 2.0,
+        borderColor: Colors.white,
         strokeCap: StrokeCap.round,
         strokeJoin: StrokeJoin.round,
       ));
       return lines;
     }
 
-    // Découpage Mock: 10% Bleu, 15% Orange, 15% Rouge, reste Bleu
-    int i1 = (pointsItineraire.length * 0.1).round();
-    int i2 = (pointsItineraire.length * 0.25).round();
-    int i3 = (pointsItineraire.length * 0.40).round();
-
-    lines.add(Polyline(points: pointsItineraire.sublist(0, i1 + 1), color: const Color(0xFF007AFF), strokeWidth: 6.0, strokeJoin: StrokeJoin.round, strokeCap: StrokeCap.round));
-    lines.add(Polyline(points: pointsItineraire.sublist(i1, i2 + 1), color: const Color(0xFFFF9500), strokeWidth: 6.0, strokeJoin: StrokeJoin.round, strokeCap: StrokeCap.round));
-    lines.add(Polyline(points: pointsItineraire.sublist(i2, i3 + 1), color: const Color(0xFFFF3B30), strokeWidth: 6.0, strokeJoin: StrokeJoin.round, strokeCap: StrokeCap.round));
-    lines.add(Polyline(points: pointsItineraire.sublist(i3, pointsItineraire.length), color: const Color(0xFF007AFF), strokeWidth: 6.0, strokeJoin: StrokeJoin.round, strokeCap: StrokeCap.round));
+    // 2. S'il y a du trafic, on dessine chaque segment coloré avec sa bordure
+    for (var segment in segmentsTrafic) {
+      if (segment.startIndex >= 0 && segment.endIndex < pointsItineraire.length && segment.startIndex < segment.endIndex) {
+        lines.add(Polyline(
+          points: pointsItineraire.sublist(segment.startIndex, segment.endIndex + 1),
+          color: segment.color,
+          strokeWidth: 6.0,
+          borderStrokeWidth: 2.0,
+          borderColor: Colors.white,
+          strokeJoin: StrokeJoin.round,
+          strokeCap: StrokeCap.round,
+        ));
+      }
+    }
 
     return lines;
   }
@@ -457,12 +495,105 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     return polyline;
   }
 
+  // --- APPEL API TOMTOM TRAFIC ASYNCHRONE CORRIGÉ ---
+  Future<void> _fetchTomTomTraffic(LatLng depart, LatLng arrivee) async {
+    final url = Uri.parse(
+        'https://api.tomtom.com/routing/1/calculateRoute/${depart.latitude},${depart.longitude}:${arrivee.latitude},${arrivee.longitude}/json?key=$tomtomApiKey&sectionType=traffic&traffic=true');
+    
+    try {
+      final reponse = await http.get(url);
+      if (reponse.statusCode == 200) {
+        final data = json.decode(reponse.body);
+        final routes = data['routes'];
+        if (routes == null || routes.isEmpty) return;
+        
+        final route = routes[0];
+        final sections = route['sections'] as List?;
+        final legs = route['legs'] as List?;
+        if (sections == null || legs == null || legs.isEmpty) return;
+        
+        final pointsTomTom = legs[0]['points'] as List;
+        List<TrafficSegment> newSegments = [];
+        int lastValhallaMappedIndex = 0;
+
+        for (var sec in sections) {
+          if (sec['sectionType'] == 'TRAFFIC') {
+            int startIdxTT = sec['startPointIndex'];
+            int endIdxTT = sec['endPointIndex'];
+            int magnitude = sec['magnitudeOfDelay'] ?? 0;
+            
+            // Déterminer la couleur
+            Color trafficColor = const Color(0xFF007AFF); // Bleu
+            if (magnitude >= 3) {
+              trafficColor = const Color(0xFFFF3B30); // Rouge vif
+            } else if (magnitude >= 1) {
+              trafficColor = const Color(0xFFFF9500); // Orange
+            }
+
+            if (startIdxTT < pointsTomTom.length && endIdxTT < pointsTomTom.length) {
+              double startLat = pointsTomTom[startIdxTT]['latitude'];
+              double startLon = pointsTomTom[startIdxTT]['longitude'];
+              double endLat = pointsTomTom[endIdxTT]['latitude'];
+              double endLon = pointsTomTom[endIdxTT]['longitude'];
+
+              // Recherche ultra-rapide sans limite de 500 points (Pythagore)
+              int valhallaStart = lastValhallaMappedIndex;
+              double bestDistStart = double.infinity;
+              for(int i = lastValhallaMappedIndex; i < pointsItineraire.length; i++) {
+                double dLat = startLat - pointsItineraire[i].latitude;
+                double dLon = startLon - pointsItineraire[i].longitude;
+                double distSq = (dLat * dLat) + (dLon * dLon);
+                if (distSq < bestDistStart) { bestDistStart = distSq; valhallaStart = i; }
+              }
+
+              int valhallaEnd = valhallaStart;
+              double bestDistEnd = double.infinity;
+              for(int i = valhallaStart; i < pointsItineraire.length; i++) {
+                double dLat = endLat - pointsItineraire[i].latitude;
+                double dLon = endLon - pointsItineraire[i].longitude;
+                double distSq = (dLat * dLat) + (dLon * dLon);
+                if (distSq < bestDistEnd) { bestDistEnd = distSq; valhallaEnd = i; }
+              }
+              
+              // Création propre des segments
+              if (valhallaStart > lastValhallaMappedIndex) {
+                newSegments.add(TrafficSegment(lastValhallaMappedIndex, valhallaStart, const Color(0xFF007AFF)));
+              }
+              if (valhallaEnd > valhallaStart) {
+                newSegments.add(TrafficSegment(valhallaStart, valhallaEnd, trafficColor));
+                lastValhallaMappedIndex = valhallaEnd;
+              }
+            }
+          }
+        }
+
+        // Remplir la toute fin de la route en Bleu s'il reste des points
+        if (lastValhallaMappedIndex < pointsItineraire.length - 1) {
+          newSegments.add(TrafficSegment(lastValhallaMappedIndex, pointsItineraire.length - 1, const Color(0xFF007AFF)));
+        }
+
+        if (mounted) {
+          setState(() {
+            segmentsTrafic = newSegments;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint("Erreur TomTom Trafic: $e");
+    }
+  }
+
   // --- FONCTION VALHALLA (L'ITINÉRAIRE) ---
   Future<void> calculerRoute(
     LatLng depart,
     LatLng arrivee,
     String costing,
   ) async {
+    setState(() {
+      segmentsTrafic = [];
+    });
+
+
     final url = Uri.parse('https://valhalla.zeusmos.fr/route');
     final corps = json.encode({
       "locations": [
@@ -471,6 +602,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
       ],
       "costing": costing,
       "units": "kilometers",
+      "directions_options": {"language": "fr-FR"}
     });
 
     try {
@@ -479,20 +611,27 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
         final data = json.decode(reponse.body);
         final shape = data['trip']['legs'][0]['shape'];
 
-        // Extraction de la durée et distance pour l'aperçu
         final summary = data['trip']['summary'];
-        final length = summary['length']; // km
-        final timeFormatter = summary['time']; // secondes
+        final length = summary['length']; 
+        final timeFormatter = summary['time']; 
 
         final hours = timeFormatter ~/ 3600;
         final mins = (timeFormatter % 3600) ~/ 60;
 
         List<LatLng> result = _decodeValhallaPolyline(shape);
         List<int> speeds = List.filled(result.length, 0);
-        
-        // Extraction des speed_limits des maneuvers
+        String prochaineInstruction = "En route"; // <--- NOUVEAU
+
         try {
           final maneuvers = data['trip']['legs'][0]['maneuvers'] as List;
+          
+          // --- EXTRACTION DE LA VRAIE INSTRUCTION ---
+          if (maneuvers.length > 1) {
+            prochaineInstruction = maneuvers[1]['instruction']; 
+          } else if (maneuvers.isNotEmpty) {
+            prochaineInstruction = maneuvers[0]['instruction'];
+          }
+
           for(var m in maneuvers) {
             int begin = m['begin_shape_index'] ?? 0;
             int end = m['end_shape_index'] ?? 0;
@@ -505,17 +644,22 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
             }
           }
         } catch(e) {
-          debugPrint("Erreur SpeedLimits Extract: $e");
+          debugPrint("Erreur Extract: $e");
         }
 
         setState(() {
           pointsItineraire = result;
           pointsSpeedLimit = speeds;
+          instructionActive = prochaineInstruction;
           distanceTextApercu = "${length.toStringAsFixed(1)} km";
           etaTextApercu = hours > 0
               ? "$hours h ${mins.toString().padLeft(2, '0')} min"
               : "$mins min";
         });
+
+        if (costing == 'auto') {
+          _fetchTomTomTraffic(depart, arrivee);
+        }
 
         if (pointsItineraire.isNotEmpty && !modeNavigation) {
           _mapController.fitCamera(
@@ -651,6 +795,11 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
                 Text('SP98 : ${station['sp98_prix']} €'),
               if (station['e85_prix'] != null)
                 Text('E85 : ${station['e85_prix']} €'),
+              
+              _buildBoutonItineraire(
+                LatLng(station['geom']['lat'], station['geom']['lon']), 
+                station['adresse'] ?? 'Station Essence'
+              ),
             ],
           ),
         );
@@ -1038,9 +1187,12 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
             ),
             children: [
               TileLayer(
-                urlTemplate:
-                    'https://tileserver.zeusmos.fr/styles/osm-liberty/{z}/{x}/{y}.png',
+                // urlTemplate: 'https://tileserver.zeusmos.fr/styles/osm-liberty/{z}/{x}/{y}.png',
+                urlTemplate: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png',
+                subdomains: const ['a', 'b', 'c', 'd'],
                 userAgentPackageName: 'com.jeremy.gps',
+                keepBuffer: 5,
+                panBuffer: 2,
               ),
               PolylineLayer(
                 polylines: _buildTrafficPolylines(),
@@ -1410,11 +1562,71 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
               ),
             ),
 
-          // ── ALERTE RADAR PROXIMITÉ (Style Float) ────────────
+          // ── 1. PANNEAU DIRECTIONS HAUT ────────────
+          if (modeNavigation)
+            Positioned(
+              top: 50,
+              left: 16,
+              right: 16,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(24),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1C1C1E).withValues(alpha: 0.85),
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(color: Colors.white.withValues(alpha: 0.15), width: 1),
+                      boxShadow: [
+                        BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 15, offset: const Offset(0, 8)),
+                      ],
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.1),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(Icons.turn_right, color: Colors.white, size: 32),
+                        ),
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text(
+                                "Prochaine direction", // Texte générique ou distance au virage (à coder plus tard)
+                                style: TextStyle(color: Colors.white70, fontSize: 16, fontWeight: FontWeight.w500),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                instructionActive, // <--- LA VRAIE INSTRUCTION VALHALLA
+                                style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // ── 2. ALERTE RADAR PROXIMITÉ ────────────
           AnimatedPositioned(
             duration: const Duration(milliseconds: 400),
             curve: Curves.easeOutBack,
-            top: radarProcheDistance != double.infinity ? 60 : -120, // Animé depuis le haut
+            // S'il y a un radar : On le met à top: 150 s'il y a le bandeau de nav, sinon top: 60
+            top: radarProcheDistance != double.infinity 
+                  ? (modeNavigation ? 160 : 60) 
+                  : -120, 
             left: 20,
             right: 20,
             child: Material(
@@ -1429,11 +1641,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
                   ),
                   borderRadius: BorderRadius.circular(16),
                   boxShadow: [
-                    BoxShadow(
-                      color: Colors.redAccent.withValues(alpha: 0.5),
-                      blurRadius: 15,
-                      offset: const Offset(0, 6),
-                    ),
+                    BoxShadow(color: Colors.redAccent.withValues(alpha: 0.5), blurRadius: 15, offset: const Offset(0, 6)),
                   ],
                   border: Border.all(color: Colors.white.withValues(alpha: 0.2), width: 1.5),
                 ),
@@ -1464,90 +1672,10 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
             ),
           ),
 
-          // ── PANNEAU DIRECTIONS HAUT (Style Waze Glassmorphism) ────────────
-          if (modeNavigation)
-            Positioned(
-              top: 50,
-              left: 16,
-              right: 16,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(24),
-                child: BackdropFilter(
-                  filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 20,
-                      vertical: 16,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1C1C1E).withValues(alpha: 0.85),
-                      borderRadius: BorderRadius.circular(24),
-                      border: Border.all(
-                        color: Colors.white.withValues(alpha: 0.15),
-                        width: 1,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.3),
-                          blurRadius: 15,
-                          offset: const Offset(0, 8),
-                        ),
-                      ],
-                    ),
-                    child: Row(
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.1),
-                            shape: BoxShape.circle,
-                          ),
-                          child: const Icon(
-                            Icons
-                                .turn_right, // Direction (statique pour l'instant)
-                            color: Colors.white,
-                            size: 32,
-                          ),
-                        ),
-                        const SizedBox(width: 16),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Text(
-                                "Dans 300 m",
-                                style: TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                "Prendre la direction de ${_searchController.text}",
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 22,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
           // ── COMPTEUR DE VITESSE (Style Waze) ────────────
           if (modeNavigation)
             Positioned(
-              bottom: 130, // Juste au-dessus du panneau ETA
+              bottom: 160, // Juste au-dessus du panneau ETA
               left: 16,
               child: Row(
                 children: [
@@ -1924,6 +2052,14 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
 
   // Marqueur Voiture de Navigation (Style Waze / 3D)
   Widget _buildCarMarker() {
+    IconData iconeCurseur = Icons.directions_car;
+    
+    if (transportMode == 'bicycle') {
+      iconeCurseur = Icons.pedal_bike;
+    } else if (transportMode == 'pedestrian') {
+      iconeCurseur = Icons.directions_walk;
+    }
+
     return Container(
       decoration: BoxDecoration(
         color: Colors.white,
@@ -1933,8 +2069,8 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
           BoxShadow(color: Colors.black45, blurRadius: 8, offset: Offset(0, 4)),
         ],
       ),
-      child: const Center(
-        child: Icon(Icons.directions_car, color: Colors.black87, size: 28),
+      child: Center(
+        child: Icon(iconeCurseur, color: Colors.black87, size: 24),
       ),
     );
   }
