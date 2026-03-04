@@ -688,12 +688,28 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
           mesRadars = radarsAPI.map((radar) {
             return Marker(
               point: LatLng(radar['latitude'], radar['longitude']),
-              width: 50,
-              height: 50,
-              child: const Icon(
-                Icons.warning_amber_rounded,
-                color: Colors.redAccent,
-                size: 30,
+              width: 45,
+              height: 45,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.redAccent.shade700, width: 3),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.redAccent.withValues(alpha: 0.4),
+                      blurRadius: 8,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: const Center(
+                  child: Icon(
+                    Icons.camera_alt,
+                    color: Colors.black87,
+                    size: 22,
+                  ),
+                ),
               ),
             );
           }).toList();
