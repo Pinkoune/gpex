@@ -3,27 +3,45 @@ PODS:
   - geolocator_apple (1.2.0):
     - Flutter
     - FlutterMacOS
+  - MapLibre (5.12.2)
+  - maplibre_gl (0.0.1):
+    - Flutter
+    - MapLibre (~> 5.12.2)
+    - MapLibreAnnotationExtension (~> 0.0.1-beta.2)
+  - MapLibreAnnotationExtension (0.0.1-beta.2):
+    - MapLibre (~> 5.12.0)
   - package_info_plus (0.4.5):
     - Flutter
 
 DEPENDENCIES:
   - Flutter (from `Flutter`)
   - geolocator_apple (from `.symlinks/plugins/geolocator_apple/darwin`)
+  - maplibre_gl (from `.symlinks/plugins/maplibre_gl/ios`)
   - package_info_plus (from `.symlinks/plugins/package_info_plus/ios`)
+
+SPEC REPOS:
+  https://github.com/m0nac0/flutter-maplibre-podspecs.git:
+    - MapLibre
+    - MapLibreAnnotationExtension
 
 EXTERNAL SOURCES:
   Flutter:
     :path: Flutter
   geolocator_apple:
     :path: ".symlinks/plugins/geolocator_apple/darwin"
+  maplibre_gl:
+    :path: ".symlinks/plugins/maplibre_gl/ios"
   package_info_plus:
     :path: ".symlinks/plugins/package_info_plus/ios"
 
 SPEC CHECKSUMS:
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   geolocator_apple: ab36aa0e8b7d7a2d7639b3b4e48308394e8cef5e
+  MapLibre: 5aa820115d91293a4d09e681e7470f88bd34b672
+  maplibre_gl: bea8751e9733923f9d266fe51d120f5db7667c54
+  MapLibreAnnotationExtension: bc7f1041206218d7d24ba0908e3145cd54b86664
   package_info_plus: af8e2ca6888548050f16fa2f1938db7b5a5df499
 
-PODFILE CHECKSUM: 3c63482e143d1b91d2d2560aee9fb04ecc74ac7e
+PODFILE CHECKSUM: ab1d13e13d9fbf75f012ecc7718c75bca2cac997
 
 COCOAPODS: 1.16.2

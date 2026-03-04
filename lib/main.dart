@@ -1,13 +1,12 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
+import 'package:maplibre_gl/mapbox_gl.dart'; // Remplace flutter_map et latlong2
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:ui'; // Pour le BackdropFilter (Glassmorphism)
 import 'package:geolocator/geolocator.dart';
-import 'dart:math';
 
 const String tomtomApiKey = "gCm05RjVrOc3Ew1WlUgn9zrbjImAKW9n";
+const String mapTilerApiKey = "iK3uh8aiosMMylpf5nhx";
 
 class TrafficSegment {
   final int startIndex;
@@ -41,12 +40,12 @@ class CarteScreen extends StatefulWidget {
   State<CarteScreen> createState() => _CarteScreenState();
 }
 
-class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin {
-  final MapController _mapController = MapController();
+class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderStateMixin
+  MaplibreMapController? _mapController;
   String instructionActive = "Suivez l'itinéraire";
   bool _estCartePrete = false; // Flag pour s'assurer que la carte est prête
   LatLng maPosition = const LatLng(43.6046, 1.4442);
-  List<Marker> mesRadars = [];
+  List<dynamic> mesRadarsData = [];
   bool gpsActif = false;
   // --- NOUVELLES VARIABLES ---
   List<LatLng> pointsItineraire = []; // La ligne bleue
@@ -57,11 +56,6 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
   List<int> pointsSpeedLimit = []; // Limitations par Shape Index
   List<TrafficSegment> segmentsTrafic = []; // Segments de couleurs calculés
 
-  // --- ANIMATIONS MAP ---
-  AnimationController? _animController;
-  Animation<double>? _zoomAnim;
-  Animation<double>? _rotAnim;
-  Animation<LatLng>? _centerAnim;
   
   double radarProcheDistance = double.infinity; // Radar info
 
@@ -78,10 +72,11 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
   bool afficherParking = false;
   bool afficherBornes = false;
   bool afficherTourisme = false;
-  List<Marker> markersEssence = [];
-  List<Marker> markersParking = [];
-  List<Marker> markersBornes = [];
-  List<Marker> markersTourisme = [];
+  List<Circle> markersEssence = [];
+  List<Circle> markersParking = [];
+  List<Circle> markersBornes = [];
+  List<Circle> markersTourisme = [];
+  List<Circle> mesRadars = [];
   List<dynamic> dataEssence = [];
   List<dynamic> dataParking = [];
   List<dynamic> dataBornes = [];
@@ -105,7 +100,6 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
   void dispose() {
     _searchController.dispose();
     _searchFocus.dispose();
-    _animController?.dispose();
     super.dispose();
   }
 
@@ -134,7 +128,6 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
 
       if (_estCartePrete) {
         if (modeNavigation) {
-          // Calcul Zoom Dynamique : à 0-20km/h => zoom 18. à >80km/h => zoom 16
           double targetZoom = 18.0;
           if (vitesseKmh > 80) {
             targetZoom = 15.5;
@@ -142,35 +135,39 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
             targetZoom = 16.5;
           }
           
-          double targetRot = position.heading > 0 ? (360 - position.heading) : 0.0;
-
+          double targetRot = position.heading > 0 ? position.heading : 0.0;
           
-          // Aligner virtuellement le véhicule en bas. 
-          // (Décaler le LatLng cible vers le HAUT pour compenser)
-          // Approximation basique proportionnelle au zoom.
-          double offsetLat = (0.0005 * (18.0 / targetZoom)) * cos(position.heading * pi / 180);
-          double offsetLng = (0.0005 * (18.0 / targetZoom)) * sin(position.heading * pi / 180);
-          LatLng targetCenter = LatLng(maPosition.latitude + offsetLat, maPosition.longitude + offsetLng);
-
-          _animerCarte(targetCenter, targetZoom, targetRot);
+          // MaplibreGL permet nativement de gérer l'inclinaison (tilt) et le cap (bearing) !
+          // On n'a plus besoin du trick de calcul d'offset puisque Maplibre le gère seul
+          _mapController?.animateCamera(
+            CameraUpdate.newCameraPosition(
+              CameraPosition(
+                target: maPosition,
+                zoom: targetZoom,
+                bearing: targetRot,
+                tilt: 55.0, // Inclinaison 3D style Apple Maps
+              ),
+            ),
+          );
         } else {
-          // _mapController.move(maPosition, 15.0); // Simple centrage sans rotation fixe
+           // Sans anim pour coller au basique de la 2D ? 
+           //_mapController?.animateCamera(CameraUpdate.newCameraPosition(CameraPosition(target: maPosition, tilt: 0.0, bearing: 0.0)));
         }
       }
       chargerRadars();
       
       // Radar Alert Logic
       double minDistRadar = double.infinity;
-      if (modeNavigation && gpsActif && mesRadars.isNotEmpty) {
-        for (var marker in mesRadars) {
+      if (modeNavigation && gpsActif && mesRadarsData.isNotEmpty) {
+        for (var radar in mesRadarsData) {
           double dist = Geolocator.distanceBetween(
               position.latitude, position.longitude,
-              marker.point.latitude, marker.point.longitude);
+              radar['lat'], radar['lon']);
           
           if (dist <= 800) { // Afficher jusqu'à 800m
              double bearing = Geolocator.bearingBetween(
                 position.latitude, position.longitude,
-                marker.point.latitude, marker.point.longitude);
+                radar['lat'], radar['lon']);
              double angleDiff = (bearing - position.heading).abs();
              if (angleDiff > 180) angleDiff = 360 - angleDiff;
              if (angleDiff <= 60) {
@@ -257,7 +254,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
           gpsActif = true;
         });
         if (_estCartePrete) {
-          _mapController.move(maPosition, 15.0);
+          _mapController?.animateCamera(CameraUpdate.newLatLngZoom(maPosition, 15.0));
         }
       }
     } catch (_) {}
@@ -283,7 +280,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
           gpsActif = true;
         });
         if (_estCartePrete) {
-          _mapController.move(maPosition, 15.0);
+          _mapController?.animateCamera(CameraUpdate.newLatLngZoom(maPosition, 15.0));
         }
         chargerRadars();
       }
@@ -319,75 +316,93 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     );
   }
 
-  void _animerCarte(LatLng cible, double destZoom, double destRot) {
-    _animController?.dispose();
-    _animController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1000), // Smooth 1 sec
-    );
+  // --- TRAFFIC EN GEOJSON (MAPLIBRE GL) ---
+  void _updateRouteGeoJson() async {
+    if (_mapController == null || !_estCartePrete) return;
 
-    final LatLng startX = _mapController.camera.center;
-    final double startZ = _mapController.camera.zoom;
-    final double startR = _mapController.camera.rotation;
-
-    // Normalisation Rotation target to nearest 360 loop to avoid spin-around
-    double shortRot = destRot;
-    if ((destRot - startR).abs() > 180) {
-      if (destRot > startR) {
-        shortRot -= 360;
-      } else {
-        shortRot += 360;
-      }
+    if (pointsItineraire.isEmpty) {
+      await _mapController!.setGeoJsonSource("route-source", {
+        "type": "FeatureCollection",
+        "features": []
+      });
+      return;
     }
 
-    _centerAnim = LatLngTween(begin: startX, end: cible).animate(CurvedAnimation(parent: _animController!, curve: Curves.easeOut));
-    _zoomAnim = Tween<double>(begin: startZ, end: destZoom).animate(CurvedAnimation(parent: _animController!, curve: Curves.easeOut));
-    _rotAnim = Tween<double>(begin: startR, end: shortRot).animate(CurvedAnimation(parent: _animController!, curve: Curves.easeOut));
+    List<Map<String, dynamic>> features = [];
 
-    _animController!.addListener(() {
-      _mapController.move(_centerAnim!.value, _zoomAnim!.value);
-      _mapController.rotate(_rotAnim!.value);
+    // 1. Ligne Blanche en Contour (Style Apple Maps)
+    List<List<double>> fullCoords = pointsItineraire.map((p) => [p.longitude, p.latitude]).toList();
+    features.add({
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": fullCoords
+      },
+      "properties": {
+        "color": "#FFFFFF",
+        "isBorder": true
+      }
     });
 
-    _animController!.forward();
-  }
-
-  // --- TRAFFIC REEL (TOMTOM) CORRIGÉ ---
-  List<Polyline> _buildTrafficPolylines() {
-    if (pointsItineraire.isEmpty) return [];
-
-    List<Polyline> lines = [];
-
-    // 1. Fallback si TomTom ne répond pas ou est vide
+    // 2. La route principale (Bleue unie ou Multicolore selon le trafic)
     if (segmentsTrafic.isEmpty) {
-      lines.add(Polyline(
-        points: pointsItineraire,
-        color: const Color(0xFF007AFF),
-        strokeWidth: 6.0,
-        borderStrokeWidth: 2.0,
-        borderColor: Colors.white,
-        strokeCap: StrokeCap.round,
-        strokeJoin: StrokeJoin.round,
-      ));
-      return lines;
-    }
+      features.add({
+        "type": "Feature",
+        "geometry": {
+          "type": "LineString",
+          "coordinates": fullCoords
+        },
+        "properties": {
+          "color": "#007AFF", // Bleu natif iOS
+          "isBorder": false
+        }
+      });
+    } else {
+      for (var segment in segmentsTrafic) {
+        if (segment.startIndex >= 0 && segment.endIndex < pointsItineraire.length && segment.startIndex < segment.endIndex) {
+          List<List<double>> segCoords = pointsItineraire
+              .sublist(segment.startIndex, segment.endIndex + 1)
+              .map((p) => [p.longitude, p.latitude])
+              .toList();
+          
+          String hexColor = '#${(segment.color.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0').toUpperCase()}';
 
-    // 2. S'il y a du trafic, on dessine chaque segment coloré avec sa bordure
-    for (var segment in segmentsTrafic) {
-      if (segment.startIndex >= 0 && segment.endIndex < pointsItineraire.length && segment.startIndex < segment.endIndex) {
-        lines.add(Polyline(
-          points: pointsItineraire.sublist(segment.startIndex, segment.endIndex + 1),
-          color: segment.color,
-          strokeWidth: 6.0,
-          borderStrokeWidth: 2.0,
-          borderColor: Colors.white,
-          strokeJoin: StrokeJoin.round,
-          strokeCap: StrokeCap.round,
-        ));
+          // --- C'EST ICI QU'ON DESSINE LE MORCEAU DE COULEUR ---
+          features.add({
+            "type": "Feature",
+            "geometry": {
+              "type": "LineString",
+              "coordinates": segCoords
+            },
+            "properties": {
+              "color": hexColor,
+              "isBorder": false
+            }
+          });
+        }
       }
     }
 
-    return lines;
+    // 3. --- AJOUT DU POINT D'ARRIVÉE (Une seule fois à la toute fin) ---
+    if (destination != null && pointsItineraire.isNotEmpty) {
+      features.add({
+        "type": "Feature",
+        "geometry": {
+          "type": "Point",
+          "coordinates": [destination!.longitude, destination!.latitude]
+        },
+        "properties": {
+          "isDestination": true,
+          "isBorder": false
+        }
+      });
+    }
+
+    // Mise à jour de la source sur la carte MapLibre
+    await _mapController!.setGeoJsonSource("route-source", {
+      "type": "FeatureCollection",
+      "features": features
+    });
   }
 
   // --- SUGGESTIONS TEMPS RÉEL ---
@@ -438,6 +453,24 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     setState(() {
       modeApercuTrajet = true;
     });
+
+    // Centrer la caméra pour qu'on voit l'intégralité du trajet
+    if (pointsItineraire.isNotEmpty && _mapController != null) {
+        double minLat = pointsItineraire.first.latitude;
+        double minLng = pointsItineraire.first.longitude;
+        double maxLat = minLat;
+        double maxLng = minLng;
+        for (var p in pointsItineraire) {
+           if (p.latitude < minLat) minLat = p.latitude;
+           if (p.longitude < minLng) minLng = p.longitude;
+           if (p.latitude > maxLat) maxLat = p.latitude;
+           if (p.longitude > maxLng) maxLng = p.longitude;
+        }
+        _mapController!.animateCamera(CameraUpdate.newLatLngBounds(
+           LatLngBounds(southwest: LatLng(minLat, minLng), northeast: LatLng(maxLat, maxLng)),
+           left: 50, right: 50, top: 50, bottom: 200 // Padding pour la vue UI
+        ));
+    }
   }
 
   // --- FONCTION RECHERCHE (LOOK WAZE) ---
@@ -576,6 +609,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
           setState(() {
             segmentsTrafic = newSegments;
           });
+          _updateRouteGeoJson();
         }
       }
     } catch (e) {
@@ -657,16 +691,28 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
               : "$mins min";
         });
 
+        _updateRouteGeoJson();
+
         if (costing == 'auto') {
           _fetchTomTomTraffic(depart, arrivee);
         }
 
-        if (pointsItineraire.isNotEmpty && !modeNavigation) {
-          _mapController.fitCamera(
-            CameraFit.bounds(
-              bounds: LatLngBounds.fromPoints(pointsItineraire),
-              padding: const EdgeInsets.all(80),
-            ),
+        if (pointsItineraire.isNotEmpty && !modeNavigation && _mapController != null) {
+          double minLat = pointsItineraire.first.latitude;
+          double minLng = pointsItineraire.first.longitude;
+          double maxLat = minLat;
+          double maxLng = minLng;
+          for (var p in pointsItineraire) {
+             if (p.latitude < minLat) minLat = p.latitude;
+             if (p.longitude < minLng) minLng = p.longitude;
+             if (p.latitude > maxLat) maxLat = p.latitude;
+             if (p.longitude > maxLng) maxLng = p.longitude;
+          }
+          _mapController!.animateCamera(
+             CameraUpdate.newLatLngBounds(
+                 LatLngBounds(southwest: LatLng(minLat, minLng), northeast: LatLng(maxLat, maxLng)),
+                 left: 80, right: 80, top: 80, bottom: 80
+             )
           );
         }
       }
@@ -683,41 +729,36 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
       final reponse = await http.get(url);
       if (reponse.statusCode == 200) {
         final data = json.decode(reponse.body);
-        final List radarsAPI = data['radars'];
-        setState(() {
-          mesRadars = radarsAPI.map((radar) {
-            return Marker(
-              point: LatLng(radar['latitude'], radar['longitude']),
-              width: 45,
-              height: 45,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.redAccent.shade700, width: 3),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.redAccent.withValues(alpha: 0.4),
-                      blurRadius: 8,
-                      offset: const Offset(0, 4),
-                    ),
-                  ],
-                ),
-                child: const Center(
-                  child: Icon(
-                    Icons.camera_alt,
-                    color: Colors.black87,
-                    size: 22,
-                  ),
-                ),
-              ),
-            );
-          }).toList();
-        });
+        mesRadarsData = data['radars'];
+        _majMarkersRadars();
       }
     } catch (e) {
       debugPrint("Erreur API: $e");
     }
+  }
+
+  void _majMarkersRadars() async {
+    if (mesRadars.isNotEmpty && _mapController != null) {
+      await _mapController!.removeCircles(mesRadars);
+      mesRadars.clear();
+    }
+    if (_mapController == null) return;
+
+    List<CircleOptions> options = [];
+    List<Map<String, dynamic>> datas = [];
+    
+    for (var radar in mesRadarsData) {
+      options.add(CircleOptions(
+        geometry: LatLng(radar['latitude'], radar['longitude']),
+        circleColor: "#FF3B30",
+        circleRadius: 8.0,
+        circleStrokeColor: "#FFFFFF",
+        circleStrokeWidth: 2.0,
+      ));
+      datas.add({'type': 'radar', 'data': radar});
+    }
+    
+    mesRadars = await _mapController!.addCircles(options, datas);
   }
 
   Future<void> chargerEssence() async {
@@ -736,53 +777,26 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     }
   }
 
-  void _majMarkersEssence() {
-    double minPrix = double.infinity;
-    for (var station in dataEssence) {
-      double? prix = station['gazole_prix'] ?? station['e10_prix'];
-      if (prix != null && prix < minPrix) {
-        minPrix = prix;
-      }
+  void _majMarkersEssence() async {
+    if (markersEssence.isNotEmpty && _mapController != null) {
+      await _mapController!.removeCircles(markersEssence);
+      markersEssence.clear();
     }
+    if (!afficherEssence || _mapController == null) return;
 
-    setState(() {
-      markersEssence = dataEssence.map((station) {
-        double? prix = station['gazole_prix'] ?? station['e10_prix'];
-        bool estMoinsChere = prix != null && prix == minPrix;
-        String textePrix = prix != null
-            ? "${prix.toStringAsFixed(3)} €"
-            : "N/A";
-
-        return Marker(
-          point: LatLng(station['geom']['lat'], station['geom']['lon']),
-          width: 70,
-          height: 30,
-          child: GestureDetector(
-            onTap: () => _afficherDetailsEssence(station),
-            child: Container(
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: estMoinsChere ? Colors.green : Colors.orange,
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: const [
-                  BoxShadow(color: Colors.black26, blurRadius: 4),
-                ],
-              ),
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-              child: Text(
-                textePrix,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 11,
-                ),
-                textAlign: TextAlign.center,
-              ),
-            ),
-          ),
-        );
-      }).toList();
-    });
+    List<CircleOptions> options = [];
+    List<Map<String, dynamic>> datas = [];
+    for (var station in dataEssence) {
+      options.add(CircleOptions(
+        geometry: LatLng(station['geom']['lat'], station['geom']['lon']),
+        circleColor: "#FF9500",
+        circleRadius: 8.0,
+        circleStrokeColor: "#FFFFFF",
+        circleStrokeWidth: 2.0,
+      ));
+      datas.add({'type': 'essence', 'data': station});
+    }
+    markersEssence = await _mapController!.addCircles(options, datas);
   }
 
   void _afficherDetailsEssence(dynamic station) {
@@ -839,64 +853,26 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     }
   }
 
-  void _majMarkersParking() {
-    double minTarif = double.infinity;
-    for (var parking in dataParking) {
-      double? tarif = parking['tarif_1h']; // On compare le tarif 1h
-      if (tarif != null && tarif < minTarif) {
-        minTarif = tarif;
-      }
+  void _majMarkersParking() async {
+    if (markersParking.isNotEmpty && _mapController != null) {
+      await _mapController!.removeCircles(markersParking);
+      markersParking.clear();
     }
+    if (!afficherParking || _mapController == null) return;
 
-    setState(() {
-      markersParking = dataParking.map((parking) {
-        double? tarif = parking['tarif_1h'];
-        bool estMoinsCher = tarif != null && tarif == minTarif;
-        String textePrix = tarif != null
-            ? "${tarif.toStringAsFixed(2)} €"
-            : "N/A";
-
-        return Marker(
-          point: LatLng(parking['ylat'], parking['xlong']),
-          width: 70,
-          height: 35,
-          child: GestureDetector(
-            onTap: () => _afficherDetailsParking(parking),
-            child: Container(
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: estMoinsCher ? Colors.green : Colors.blue,
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: const [
-                  BoxShadow(color: Colors.black26, blurRadius: 4),
-                ],
-              ),
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(
-                    textePrix,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 11,
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                  Text(
-                    "${parking['dispo'] ?? '?'} places",
-                    style: const TextStyle(color: Colors.white70, fontSize: 9),
-                    textAlign: TextAlign.center,
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      }).toList();
-    });
+    List<CircleOptions> options = [];
+    List<Map<String, dynamic>> datas = [];
+    for (var parking in dataParking) {
+      options.add(CircleOptions(
+        geometry: LatLng(parking['ylat'], parking['xlong']),
+        circleColor: "#007AFF",
+        circleRadius: 8.0,
+        circleStrokeColor: "#FFFFFF",
+        circleStrokeWidth: 2.0,
+      ));
+      datas.add({'type': 'parking', 'data': parking});
+    }
+    markersParking = await _mapController!.addCircles(options, datas);
   }
 
   void _afficherDetailsParking(dynamic parking) {
@@ -921,6 +897,10 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
               Text('Tarif 1h : ${parking['tarif_1h']} €'),
               Text('Tarif 24h : ${parking['tarif_24h']} €'),
               Text('Gestionnaire : ${parking['gestionnaire']}'),
+              _buildBoutonItineraire(
+                 LatLng(parking['ylat'], parking['xlong']), 
+                 parking['nom'] ?? 'Parking'
+              ),
             ],
           ),
         );
@@ -945,48 +925,30 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     }
   }
 
-  void _majMarkersBornes() {
-    setState(() {
-      markersBornes = dataBornes
-          .map((borne) {
-            // Note: In ODRE API, `coordonneesxy` object has lon/lat keys often mapped correctly or swapped depending on the dataset version.
-            // But we actually have `consolidated_latitude` and `consolidated_longitude` which are safer.
-            final double? lat =
-                borne['consolidated_latitude'] ??
-                borne['coordonneesxy']?['lat'];
-            final double? lon =
-                borne['consolidated_longitude'] ??
-                borne['coordonneesxy']?['lon'];
+  void _majMarkersBornes() async {
+    if (markersBornes.isNotEmpty && _mapController != null) {
+      await _mapController!.removeCircles(markersBornes);
+      markersBornes.clear();
+    }
+    if (!afficherBornes || _mapController == null) return;
 
-            if (lat == null || lon == null) return null;
+    List<CircleOptions> options = [];
+    List<Map<String, dynamic>> datas = [];
+    for (var borne in dataBornes) {
+        final double? lat = borne['consolidated_latitude'] ?? borne['coordonneesxy']?['lat'];
+        final double? lon = borne['consolidated_longitude'] ?? borne['coordonneesxy']?['lon'];
+        if (lat == null || lon == null) continue;
 
-            return Marker(
-              point: LatLng(lat, lon),
-              width: 40,
-              height: 40,
-              child: GestureDetector(
-                onTap: () => _afficherDetailsBorne(borne),
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: Colors.green.shade700,
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Colors.white, width: 2),
-                    boxShadow: const [
-                      BoxShadow(color: Colors.black26, blurRadius: 4),
-                    ],
-                  ),
-                  child: const Icon(
-                    Icons.ev_station,
-                    color: Colors.white,
-                    size: 24,
-                  ),
-                ),
-              ),
-            );
-          })
-          .whereType<Marker>()
-          .toList();
-    });
+        options.add(CircleOptions(
+            geometry: LatLng(lat, lon),
+            circleColor: "#2fbd0cff",
+            circleRadius: 8.0,
+            circleStrokeColor: "#FFFFFF",
+            circleStrokeWidth: 2.0,
+        ));
+        datas.add({'type': 'borne', 'data': borne});
+    }
+    markersBornes = await _mapController!.addCircles(options, datas);
   }
 
   void _afficherDetailsBorne(dynamic borne) {
@@ -1082,42 +1044,30 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     }
   }
 
-  void _majMarkersTourisme() {
-    setState(() {
-      markersTourisme = dataTourisme
-          .map((lieu) {
-            final double? lat = lieu['lat'];
-            final double? lon = lieu['lon'];
+  void _majMarkersTourisme() async {
+    if (markersTourisme.isNotEmpty && _mapController != null) {
+      await _mapController!.removeCircles(markersTourisme);
+      markersTourisme.clear();
+    }
+    if (!afficherTourisme || _mapController == null) return;
 
-            if (lat == null || lon == null) return null;
+    List<CircleOptions> options = [];
+    List<Map<String, dynamic>> datas = [];
+    for (var lieu in dataTourisme) {
+        final double? lat = lieu['lat'];
+        final double? lon = lieu['lon'];
+        if (lat == null || lon == null) continue;
 
-            return Marker(
-              point: LatLng(lat, lon),
-              width: 40,
-              height: 40,
-              child: GestureDetector(
-                onTap: () => _afficherDetailsTourisme(lieu),
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: Colors.purple.shade500,
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Colors.white, width: 2),
-                    boxShadow: const [
-                      BoxShadow(color: Colors.black26, blurRadius: 4),
-                    ],
-                  ),
-                  child: const Icon(
-                    Icons.camera_alt,
-                    color: Colors.white,
-                    size: 20,
-                  ),
-                ),
-              ),
-            );
-          })
-          .whereType<Marker>()
-          .toList();
-    });
+        options.add(CircleOptions(
+            geometry: LatLng(lat, lon),
+            circleColor: "#9610abff",
+            circleRadius: 8.0,
+            circleStrokeColor: "#FFFFFF",
+            circleStrokeWidth: 2.0,
+        ));
+        datas.add({'type': 'tourisme', 'data': lieu});
+    }
+    markersTourisme = await _mapController!.addCircles(options, datas);
   }
 
   void _afficherDetailsTourisme(dynamic lieu) {
@@ -1188,60 +1138,85 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
     return Scaffold(
       body: Stack(
         children: [
-          // ── CARTE ──────────────────────────────────────────────────────────
-          FlutterMap(
-            mapController: _mapController,
-            options: MapOptions(
-              initialCenter: maPosition,
-              initialZoom: 15.0,
-              onMapReady: () {
-                _estCartePrete = true;
-                if (gpsActif) {
-                  _mapController.move(maPosition, 15.0);
-                }
-              },
-            ),
-            children: [
-              TileLayer(
-                // urlTemplate: 'https://tileserver.zeusmos.fr/styles/osm-liberty/{z}/{x}/{y}.png',
-                urlTemplate: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png',
-                subdomains: const ['a', 'b', 'c', 'd'],
-                userAgentPackageName: 'com.jeremy.gps',
-                keepBuffer: 5,
-                panBuffer: 2,
-              ),
-              PolylineLayer(
-                polylines: _buildTrafficPolylines(),
-              ),
-              MarkerLayer(markers: mesRadars),
-              if (afficherEssence) MarkerLayer(markers: markersEssence),
-              if (afficherParking) MarkerLayer(markers: markersParking),
-              if (afficherBornes) MarkerLayer(markers: markersBornes),
-              if (afficherTourisme) MarkerLayer(markers: markersTourisme),
-              MarkerLayer(
-                markers: [
-                  Marker(
-                    point: maPosition,
-                    width: 45,
-                    height: 45,
-                    child: modeNavigation
-                        ? _buildCarMarker()
-                        : _buildBlueDotMarker(),
-                  ),
-                  if (destination != null)
-                    Marker(
-                      point: destination!,
-                      width: 36,
-                      height: 36,
-                      child: const Icon(
-                        Icons.location_on,
-                        color: Colors.green,
-                        size: 36,
-                      ),
-                    ),
-                ],
-              ),
-            ],
+          // ── CARTE 3D MAPLIBRE ──────────────────────────────────────────────
+          MaplibreMap(
+            styleString: 'https://api.maptiler.com/maps/basic-v2/style.json?key=$mapTilerApiKey',
+            initialCameraPosition: CameraPosition(target: maPosition, zoom: 15.0),
+            myLocationEnabled: true,
+            myLocationTrackingMode: modeNavigation ? MyLocationTrackingMode.TrackingCompass : MyLocationTrackingMode.None,
+            compassEnabled: true,
+            // Décaler le centre visuel vers le bas de l'écran (Navigation style)
+            // Décaler le centre visuel vers le bas de l'écran (Navigation style) géré par un offset visuel
+            onMapCreated: (MaplibreMapController controller) {
+              _mapController = controller;
+              _estCartePrete = true;
+              
+              _mapController!.onCircleTapped.add((Circle circle) {
+                 final properties = circle.data;
+                 if (properties != null) {
+                    final type = properties['type'];
+                    final item = properties['data'];
+                    if (type == 'essence') {
+                      _afficherDetailsEssence(item);
+                    } else if (type == 'parking') {
+                      _afficherDetailsParking(item);
+                    } else if (type == 'borne') {
+                      _afficherDetailsBorne(item);
+                    } else if (type == 'tourisme') {
+                      _afficherDetailsTourisme(item);
+                    }
+                 }
+              });
+
+              if (gpsActif) {
+                _mapController!.animateCamera(CameraUpdate.newLatLngZoom(maPosition, 15.0));
+              }
+            },
+            onStyleLoadedCallback: () {
+              // Initialiser la source vide pour la route
+              _mapController!.addGeoJsonSource("route-source", {"type": "FeatureCollection", "features": []});
+              // Ajouter le layer de lignes par-dessus
+              _mapController!.addLineLayer(
+                "route-source",
+                "route-layer-border",
+                LineLayerProperties(
+                  lineColor: ["get", "color"],
+                  lineWidth: 10.0,
+                  lineJoin: "round",
+                  lineCap: "round",
+                ),
+                filter: ["==", "isBorder", true]
+              );
+              _mapController!.addLineLayer(
+                "route-source",
+                "route-layer-main",
+                LineLayerProperties(
+                  lineColor: ["get", "color"],
+                  lineWidth: 6.0,
+                  lineJoin: "round",
+                  lineCap: "round",
+                ),
+                filter: ["==", "isBorder", false]
+              );
+              _mapController!.addCircleLayer(
+                "route-source",
+                "destination-layer",
+                CircleLayerProperties(
+                  circleColor: "#34C759",
+                  circleRadius: 10.0,
+                  circleStrokeColor: "#FFFFFF",
+                  circleStrokeWidth: 3.0,
+                ),
+                filter: ["==", "isDestination", true]
+              );
+              _updateRouteGeoJson(); // Dessiner la route si existante
+
+              chargerRadars();
+              if (afficherEssence) chargerEssence();
+              if (afficherParking) chargerParking();
+              if (afficherBornes) chargerBornes();
+              if (afficherTourisme) chargerTourisme();
+            },
           ),
 
           // ── BARRE DE RECHERCHE + CHIPS (Cachés si mode navigation) ────────
@@ -1332,7 +1307,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
                           ),
                           const SizedBox(width: 10),
                           GestureDetector(
-                            onTap: () => _mapController.move(maPosition, 15.0),
+                            onTap: () => _mapController?.animateCamera(CameraUpdate.newLatLngZoom(maPosition, 15.0)),
                             child: Container(
                               width: 50,
                               height: 50,
@@ -1850,7 +1825,17 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
                               pointsItineraire = [];
                               _searchController.clear();
                             });
-                            _mapController.move(maPosition, 15.0);
+                            _updateRouteGeoJson();
+                            _mapController?.animateCamera(
+                              CameraUpdate.newCameraPosition(
+                                CameraPosition(
+                                  target: maPosition, 
+                                  zoom: 15.0, 
+                                  tilt: 0.0,
+                                  bearing: 0.0
+                                )
+                              )
+                            );
                           },
                           child: Container(
                             padding: const EdgeInsets.symmetric(
@@ -1989,7 +1974,7 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
                               modeNavigation = true;
                             });
                             // Zoom et rotation immersifs
-                            _mapController.move(maPosition, 18.0);
+                            _mapController?.animateCamera(CameraUpdate.newLatLngZoom(maPosition, 18.0));
                           },
                         ),
                       ],
@@ -2036,57 +2021,6 @@ class _CarteScreenState extends State<CarteScreen> with TickerProviderStateMixin
           color: isSelected ? Colors.blueAccent.shade400 : Colors.white54,
           size: 28,
         ),
-      ),
-    );
-  }
-
-  // ── CUSTOM MARKERS ────────────────────────────────────────────────────────
-
-  // Marqueur Position Google Maps (Cercle bleu avec bordure blanche et ombre)
-  Widget _buildBlueDotMarker() {
-    return Container(
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: Colors.blueAccent,
-        border: Border.all(color: Colors.white, width: 3),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.blueAccent.withValues(alpha: 0.4),
-            blurRadius: 10,
-            spreadRadius: 4,
-          ),
-          const BoxShadow(
-            color: Colors.black26,
-            blurRadius: 5,
-            offset: Offset(0, 3),
-          ),
-        ],
-      ),
-      margin: const EdgeInsets.all(12),
-    );
-  }
-
-  // Marqueur Voiture de Navigation (Style Waze / 3D)
-  Widget _buildCarMarker() {
-    IconData iconeCurseur = Icons.directions_car;
-    
-    if (transportMode == 'bicycle') {
-      iconeCurseur = Icons.pedal_bike;
-    } else if (transportMode == 'pedestrian') {
-      iconeCurseur = Icons.directions_walk;
-    }
-
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        shape: BoxShape.circle,
-        border: Border.all(color: Colors.blueAccent.shade700, width: 3),
-        boxShadow: const [
-          BoxShadow(color: Colors.black45, blurRadius: 8, offset: Offset(0, 4)),
-        ],
-      ),
-      child: Center(
-        child: Icon(iconeCurseur, color: Colors.black87, size: 24),
       ),
     );
   }
