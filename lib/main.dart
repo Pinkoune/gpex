@@ -4,6 +4,8 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:ui'; // Pour le BackdropFilter (Glassmorphism)
 import 'package:geolocator/geolocator.dart';
+import 'dart:ui' as ui;
+import 'package:flutter/services.dart';
 
 const String tomtomApiKey = "gCm05RjVrOc3Ew1WlUgn9zrbjImAKW9n";
 const String mapTilerApiKey = "iK3uh8aiosMMylpf5nhx";
@@ -72,8 +74,8 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
   bool afficherParking = false;
   bool afficherBornes = false;
   bool afficherTourisme = false;
-  List<Circle> markersEssence = [];
-  List<Circle> markersParking = [];
+  List<Symbol> markersEssence = [];
+  List<Symbol> markersParking = [];
   List<Circle> markersBornes = [];
   List<Circle> markersTourisme = [];
   List<Circle> mesRadars = [];
@@ -287,6 +289,55 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     } catch (e) {
       debugPrint("Timeout ou erreur surGetCurrentPosition initiale: $e");
     }
+  }
+
+  Future<Uint8List> _creerBulleTexte(String texte, Color couleurFond) async {
+    final ui.PictureRecorder pictureRecorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(pictureRecorder);
+    final Paint paint = Paint()..color = couleurFond;
+    const double radius = 15.0;
+
+    // 1. Préparer le texte
+    final TextPainter textPainter = TextPainter(textDirection: TextDirection.ltr);
+    textPainter.text = TextSpan(
+      text: texte,
+      style: const TextStyle(
+        fontSize: 22.0, 
+        color: Colors.white, 
+        fontWeight: FontWeight.bold,
+      ),
+    );
+    textPainter.layout();
+
+    // 2. Calculer la taille de la bulle en fonction du texte
+    final double width = textPainter.width + 24; // Padding horizontal
+    final double height = textPainter.height + 16; // Padding vertical
+
+    // 3. Dessiner le rectangle arrondi (la bulle)
+    final RRect rrect = RRect.fromRectAndRadius(
+      Rect.fromLTRB(0.0, 0.0, width, height),
+      const Radius.circular(radius),
+    );
+    canvas.drawRRect(rrect, paint);
+
+    // 4. Dessiner la petite flèche/pointe en bas de la bulle
+    final Path path = Path();
+    path.moveTo(width / 2 - 8, height);
+    path.lineTo(width / 2, height + 10);
+    path.lineTo(width / 2 + 8, height);
+    path.close();
+    canvas.drawPath(path, paint);
+
+    // 5. Placer le texte au centre de la bulle
+    textPainter.paint(canvas, const Offset(12.0, 8.0));
+
+    // 6. Convertir le tout en image binaire
+    final ui.Image image = await pictureRecorder.endRecording().toImage(
+      width.toInt(),
+      (height + 10).toInt(),
+    );
+    final ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    return byteData!.buffer.asUint8List();
   }
 
   Widget _buildBoutonItineraire(LatLng cible, String nom) {
@@ -779,24 +830,38 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
 
   void _majMarkersEssence() async {
     if (markersEssence.isNotEmpty && _mapController != null) {
-      await _mapController!.removeCircles(markersEssence);
+      await _mapController!.removeSymbols(markersEssence);
       markersEssence.clear();
     }
     if (!afficherEssence || _mapController == null) return;
 
-    List<CircleOptions> options = [];
+    List<SymbolOptions> options = [];
     List<Map<String, dynamic>> datas = [];
+    
     for (var station in dataEssence) {
-      options.add(CircleOptions(
+      String prixAffiche = "N/A";
+      if (station['gazole_prix'] != null) {
+        prixAffiche = "${station['gazole_prix']}€";
+      } else if (station['e10_prix'] != null) {
+        prixAffiche = "${station['e10_prix']}€";
+      }
+
+      String imageId = "bulle_essence_$prixAffiche";
+
+      Uint8List imageBytes = await _creerBulleTexte(prixAffiche, Colors.orange.shade700);
+      await _mapController!.addImage(imageId, imageBytes);
+
+      options.add(SymbolOptions(
         geometry: LatLng(station['geom']['lat'], station['geom']['lon']),
-        circleColor: "#FF9500",
-        circleRadius: 8.0,
-        circleStrokeColor: "#FFFFFF",
-        circleStrokeWidth: 2.0,
+        iconImage: imageId,
+        iconSize: 1.3,
+        iconAnchor: "bottom",
       ));
+      
       datas.add({'type': 'essence', 'data': station});
     }
-    markersEssence = await _mapController!.addCircles(options, datas);
+    
+    markersEssence = await _mapController!.addSymbols(options, datas);
   }
 
   void _afficherDetailsEssence(dynamic station) {
@@ -855,24 +920,33 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
 
   void _majMarkersParking() async {
     if (markersParking.isNotEmpty && _mapController != null) {
-      await _mapController!.removeCircles(markersParking);
+      await _mapController!.removeSymbols(markersParking);
       markersParking.clear();
     }
     if (!afficherParking || _mapController == null) return;
 
-    List<CircleOptions> options = [];
+    List<SymbolOptions> options = [];
     List<Map<String, dynamic>> datas = [];
+    
     for (var parking in dataParking) {
-      options.add(CircleOptions(
+      String info = parking['nb_places'] != null ? "${parking['nb_places']} pl." : "P";
+
+      String imageId = "bulle_parking_$info";
+
+      Uint8List imageBytes = await _creerBulleTexte(info, const Color(0xFF2979FF));
+      await _mapController!.addImage(imageId, imageBytes);
+
+      options.add(SymbolOptions(
         geometry: LatLng(parking['ylat'], parking['xlong']),
-        circleColor: "#007AFF",
-        circleRadius: 8.0,
-        circleStrokeColor: "#FFFFFF",
-        circleStrokeWidth: 2.0,
+        iconImage: imageId,
+        iconSize: 1.3,
+        iconAnchor: "bottom",
       ));
+      
       datas.add({'type': 'parking', 'data': parking});
     }
-    markersParking = await _mapController!.addCircles(options, datas);
+    
+    markersParking = await _mapController!.addSymbols(options, datas);
   }
 
   void _afficherDetailsParking(dynamic parking) {
@@ -1168,6 +1242,19 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                  }
               });
 
+              _mapController!.onSymbolTapped.add((Symbol symbol) {
+                final properties = symbol.data;
+                if (properties != null) {
+                  final type = properties['type'];
+                  final item = properties['data'];
+                  if (type == 'essence') {
+                    _afficherDetailsEssence(item);
+                  } else if (type == 'parking') {
+                    _afficherDetailsParking(item);
+                  }
+                }
+              });
+
               if (gpsActif) {
                 _mapController!.animateCamera(CameraUpdate.newLatLngZoom(maPosition, 15.0));
               }
@@ -1353,8 +1440,14 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                               onTap: () {
                                 setState(() {
                                   afficherEssence = !afficherEssence;
-                                  if (afficherEssence && dataEssence.isEmpty) {
-                                    chargerEssence();
+                                  if (afficherEssence) {
+                                    if (dataEssence.isEmpty) {
+                                      chargerEssence();
+                                    } else {
+                                      _majMarkersEssence();
+                                    }
+                                  } else {
+                                    _majMarkersEssence();
                                   }
                                 });
                               },
@@ -1380,8 +1473,14 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                               onTap: () {
                                 setState(() {
                                   afficherParking = !afficherParking;
-                                  if (afficherParking && dataParking.isEmpty) {
-                                    chargerParking();
+                                  if (afficherParking) {
+                                    if (dataParking.isEmpty) {
+                                      chargerParking();
+                                    } else {
+                                      _majMarkersParking();
+                                    }
+                                  } else {
+                                    _majMarkersParking();
                                   }
                                 });
                               },
@@ -1407,8 +1506,14 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                               onTap: () {
                                 setState(() {
                                   afficherBornes = !afficherBornes;
-                                  if (afficherBornes && dataBornes.isEmpty) {
-                                    chargerBornes();
+                                  if (afficherBornes) {
+                                    if (dataBornes.isEmpty) {
+                                      chargerBornes();
+                                    } else {
+                                      _majMarkersBornes();
+                                    }
+                                  } else {
+                                    _majMarkersBornes();
                                   }
                                 });
                               },
@@ -1434,9 +1539,14 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                               onTap: () {
                                 setState(() {
                                   afficherTourisme = !afficherTourisme;
-                                  if (afficherTourisme &&
-                                      dataTourisme.isEmpty) {
-                                    chargerTourisme();
+                                  if (afficherTourisme) {
+                                    if (dataTourisme.isEmpty) {
+                                      chargerTourisme();
+                                    } else {
+                                      _majMarkersTourisme();
+                                    }
+                                  } else {
+                                    _majMarkersTourisme();
                                   }
                                 });
                               },
