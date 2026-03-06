@@ -113,6 +113,85 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     super.dispose();
   }
 
+  // --- TOOL : CRÉATION DE L'ARRIVÉE TYPE WAZE ---
+  Future<Uint8List?> _createCustomMarketBitmap(String assetPath) async {
+    try {
+      // 1. Charger l'image brute (140x140 pour le zoom)
+      final ByteData data = await rootBundle.load(assetPath);
+      final ui.Codec codec = await ui.instantiateImageCodec(
+        data.buffer.asUint8List(),
+        targetWidth: 140, 
+        targetHeight: 140, 
+      );
+      final ui.FrameInfo fi = await codec.getNextFrame();
+      final ui.Image image = fi.image;
+
+      // 2. Préparer le canvas (hauteur réduite à 120 au lieu de 130)
+      const double canvasWidth = 100.0;
+      const double canvasHeight = 120.0; 
+      final ui.PictureRecorder pictureRecorder = ui.PictureRecorder();
+      final Canvas canvas = Canvas(pictureRecorder);
+
+      // Centre et rayon de la bulle blanche globale
+      const Offset center = Offset(canvasWidth / 2, 50.0);
+      const double radius = 46.0;
+
+      // Création du cercle principal
+      final Path bullePath = Path()
+        ..addOval(Rect.fromCircle(center: center, radius: radius));
+      
+      // Création de la flèche vers le bas (PLUS PETITE)
+      final Path flechePath = Path()
+        ..moveTo(canvasWidth / 2 - 12, 90.0) // Base moins large (12 au lieu de 16)
+        ..lineTo(canvasWidth / 2, 110.0)     // Pointe moins basse (110 au lieu de 125)
+        ..lineTo(canvasWidth / 2 + 12, 90.0) // Base moins large
+        ..close();
+
+      // Fusionner le cercle et la flèche
+      final Path pathFinal = Path.combine(PathOperation.union, bullePath, flechePath);
+
+      // 3. Dessiner l'ombre
+      final Paint shadowPaint = Paint()
+        ..color = Colors.black.withValues(alpha: 0.3)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4.0);
+      canvas.drawPath(pathFinal, shadowPaint);
+
+      // 4. Dessiner le fond blanc
+      final Paint borderPaint = Paint()
+        ..color = Colors.white
+        ..style = PaintingStyle.fill;
+      canvas.drawPath(pathFinal, borderPaint);
+
+      // 5. Découper la zone centrale
+      final Path clipPath = Path()
+        ..addOval(Rect.fromCircle(center: center, radius: 40.0)); 
+      
+      canvas.save();
+      canvas.clipPath(clipPath);
+
+      // Dessiner l'image avec l'effet de zoom
+      paintImage(
+        canvas: canvas,
+        rect: Rect.fromCenter(center: center, width: 140.0, height: 140.0), 
+        image: image,
+        fit: BoxFit.cover,
+      );
+      
+      canvas.restore(); 
+
+      // 6. Exporter l'image
+      final ui.Image finalImage = await pictureRecorder.endRecording().toImage(
+        canvasWidth.toInt(),
+        canvasHeight.toInt(),
+      );
+      final ByteData? byteData = await finalImage.toByteData(format: ui.ImageByteFormat.png);
+      return byteData?.buffer.asUint8List();
+    } catch (e) {
+      debugPrint("Erreur Canvas Marker: $e");
+      return null;
+    }
+  }
+
   Future<void> _activerGPS() async {
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
@@ -496,7 +575,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
       features.add({
         "type": "Feature",
         "geometry": { "type": "LineString", "coordinates": coordsParcourus },
-        "properties": { "color": "#555555", "isBorder": false } // Couleur grise
+        "properties": { "color": "#B1D7FF", "isBorder": false } // Couleur passée
       });
     }
 
@@ -1471,7 +1550,17 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                 _mapController!.animateCamera(CameraUpdate.newLatLngZoom(maPosition, 15.0));
               }
             },
-            onStyleLoadedCallback: () {
+            onStyleLoadedCallback: () async {
+              // Créer et enregistrer l'icône de destination personnalisée (damier.jpg)
+              try {
+                final Uint8List? markerIconBytes = await _createCustomMarketBitmap('assets/damier.jpg');
+                if (markerIconBytes != null) {
+                  await _mapController!.addImage("destination-icon", markerIconBytes);
+                }
+              } catch (e) {
+                debugPrint("Erreur lors de la création de l'icone damier: $e");
+              }
+
               // Initialiser la source vide pour la route
               _mapController!.addGeoJsonSource("route-source", {"type": "FeatureCollection", "features": []});
               // Ajouter le layer de lignes par-dessus
@@ -1499,14 +1588,15 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                 filter: ["==", "isBorder", false],
                 belowLayerId: "com.mapbox.annotations.points",
               );
-              _mapController!.addCircleLayer(
+              // Utiliser SymbolLayer au lieu de CircleLayer pour la destination avec THE damier flag
+              _mapController!.addSymbolLayer(
                 "route-source",
-                "destination-layer",
-                CircleLayerProperties(
-                  circleColor: "#34C759",
-                  circleRadius: 10.0,
-                  circleStrokeColor: "#FFFFFF",
-                  circleStrokeWidth: 3.0,
+                "destination-symbol",
+                const SymbolLayerProperties(
+                  iconImage: "destination-icon",
+                  iconSize: 1.5, // 1.5x plus grand
+                  iconAllowOverlap: true,
+                  iconAnchor: "bottom",
                 ),
                 filter: ["==", "isDestination", true]
               );
@@ -2357,43 +2447,38 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                               fontWeight: FontWeight.bold,
                             ),
                           ),
-                          onPressed: () async {
-                            // 1. D'abord on indique à l'interface qu'on part en Navigation MAIS qu'on est en zoom manuel
-                            // Cela désactive le TrackingGPS natif temporairement (voir MaplibreMap -> myLocationTrackingMode)
+                          onPressed: () {
+                            // 1. Démarrage instantané du mode navigation 
+                            // ON NE BLOQUE PAS le TrackingGPS pour que la flèche apparaisse TOUT DE SUITE
                             setState(() {
                               modeApercuTrajet = false;
                               modeNavigation = true;
-                              _estEnCoursDeZoom = true;
+                              _estEnCoursDeZoom = false; // La carte passe en "TrackingGPS" direct
                             });
                             
-                            // 2. Un délai de 3 secondes demandé par l'utilisateur pour laisser le temps
-                            // au moteur de charger la 3D, construire la route, et fluidifier le rendu
-                            // avant que l'on donne l'ordre d'animer la caméra.
-                            await Future.delayed(const Duration(seconds: 3));
+                            // 2. On raccroche de force le Tracking GPS immédiatement pour transformer le point en Flèche Waze
+                            _mapController?.updateMyLocationTrackingMode(MyLocationTrackingMode.TrackingGPS);
                             
-                            // 3. On lance l'animation "vrouuum"
-                            if (_mapController != null && mounted) {
-                                await _mapController!.animateCamera(
-                                   CameraUpdate.newCameraPosition(
-                                     CameraPosition(
-                                       target: maPosition,
-                                       zoom: 18.0,
-                                       tilt: 55.0, // Inclinaison 3D Waze
-                                       bearing: _mapController!.cameraPosition?.bearing ?? 0.0,
-                                     )
-                                   ),
-                                   duration: const Duration(milliseconds: 1500)
-                                );
-                            }
-
-                            // 4. Maintentant que la caméra est à destination, on peut remettre _estEnCoursDeZoom à false.
-                            // Le prochain "rebuild" (comme il y en a un par seconde avec le GPS)
-                            // remettra le mode en TrackingGPS de façon stable sur la nouvelle position !
-                            if (mounted) {
-                               setState(() {
-                                 _estEnCoursDeZoom = false;
-                               });
-                            }
+                            // 3. On attend 3 secondes le temps que la carte se charge, avec la flèche affichée
+                            Future.delayed(const Duration(seconds: 5), () {
+                                if (!mounted || _mapController == null) return;
+                                
+                                // 4. On déclenche la MÊME animation swoop 3D que le bouton "Recentrer"
+                                _mapController?.animateCamera(
+                                  CameraUpdate.newCameraPosition(
+                                    CameraPosition(
+                                      target: maPosition,
+                                      zoom: vitesseKmh > 80 ? 15.5 : 18.0,
+                                      tilt: 55.0,
+                                      bearing: _mapController?.cameraPosition?.bearing ?? 0.0,
+                                    ),
+                                  ),
+                                  duration: const Duration(milliseconds: 800),
+                                ).then((_) {
+                                   // On s'assure que le tracking reste bien accroché après le zoom
+                                   _mapController?.updateMyLocationTrackingMode(MyLocationTrackingMode.TrackingGPS);
+                                });
+                            });
                           },
                         ),
                       ],
