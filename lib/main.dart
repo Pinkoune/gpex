@@ -6,6 +6,7 @@ import 'dart:ui'; // Pour le BackdropFilter (Glassmorphism)
 import 'package:geolocator/geolocator.dart';
 import 'dart:ui' as ui;
 import 'package:flutter/services.dart';
+import 'dart:async';
 
 const String tomtomApiKey = "gCm05RjVrOc3Ew1WlUgn9zrbjImAKW9n";
 const String mapTilerApiKey = "iK3uh8aiosMMylpf5nhx";
@@ -29,7 +30,9 @@ class MonGPSRadarApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'GPS Anti-Radar',
-      theme: ThemeData.dark(),
+      theme: ThemeData.light(),
+      darkTheme: ThemeData.dark(),
+      themeMode: ThemeMode.system,
       home: const CarteScreen(),
     );
   }
@@ -49,7 +52,8 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
   LatLng maPosition = const LatLng(43.6046, 1.4442);
   List<dynamic> mesRadarsData = [];
   bool gpsActif = false;
-  // --- NOUVELLES VARIABLES ---
+  int indexRouteActuel = 0;
+  bool _enCoursDeRecalcul = false;
   List<LatLng> pointsItineraire = []; // La ligne bleue
   LatLng? destination; // Le point d'arrivée
   bool modeNavigation = false; // Mode GPS Waze-like activé
@@ -58,14 +62,18 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
   List<int> pointsSpeedLimit = []; // Limitations par Shape Index
   List<TrafficSegment> segmentsTrafic = []; // Segments de couleurs calculés
 
-  
+  // --- ONDE ---
+  bool _isOndeActive = false;
+  Timer? _timerOnde;
+  double _ondeRadius = 0.0;
+  double _ondeOpacity = 1.0;
+  LatLng? _radarCibleOnde;
+
   double radarProcheDistance = double.infinity; // Radar info
-
-
-
 
   // Aperçu du trajet (Google Maps style)
   bool modeApercuTrajet = false;
+  bool _estEnCoursDeZoom = false;
   String transportMode = 'auto'; // 'auto', 'bicycle', 'pedestrian'
   String distanceTextApercu = "";
   String etaTextApercu = "";
@@ -78,7 +86,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
   List<Symbol> markersParking = [];
   List<Circle> markersBornes = [];
   List<Circle> markersTourisme = [];
-  List<Circle> mesRadars = [];
+  List<Symbol> mesRadars = [];
   List<dynamic> dataEssence = [];
   List<dynamic> dataParking = [];
   List<dynamic> dataBornes = [];
@@ -129,29 +137,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
       });
 
       if (_estCartePrete) {
-        if (modeNavigation) {
-          double targetZoom = 18.0;
-          if (vitesseKmh > 80) {
-            targetZoom = 15.5;
-          } else if (vitesseKmh > 40) {
-            targetZoom = 16.5;
-          }
-          
-          double targetRot = position.heading > 0 ? position.heading : 0.0;
-          
-          // MaplibreGL permet nativement de gérer l'inclinaison (tilt) et le cap (bearing) !
-          // On n'a plus besoin du trick de calcul d'offset puisque Maplibre le gère seul
-          _mapController?.animateCamera(
-            CameraUpdate.newCameraPosition(
-              CameraPosition(
-                target: maPosition,
-                zoom: targetZoom,
-                bearing: targetRot,
-                tilt: 55.0, // Inclinaison 3D style Apple Maps
-              ),
-            ),
-          );
-        } else {
+        if (!modeNavigation) {
            // Sans anim pour coller au basique de la 2D ? 
            //_mapController?.animateCamera(CameraUpdate.newCameraPosition(CameraPosition(target: maPosition, tilt: 0.0, bearing: 0.0)));
         }
@@ -160,51 +146,99 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
       
       // Radar Alert Logic
       double minDistRadar = double.infinity;
+      LatLng? radarLePlusProche;
+
       if (modeNavigation && gpsActif && mesRadarsData.isNotEmpty) {
         for (var radar in mesRadarsData) {
-          double dist = Geolocator.distanceBetween(
-              position.latitude, position.longitude,
-              radar['lat'], radar['lon']);
-          
-          if (dist <= 800) { // Afficher jusqu'à 800m
-             double bearing = Geolocator.bearingBetween(
-                position.latitude, position.longitude,
-                radar['lat'], radar['lon']);
+              double dist = Geolocator.distanceBetween(
+                  position.latitude, position.longitude,
+                  radar['latitude'], radar['longitude']);
+              
+              if (dist <= 300) { // Radar dans le périmètre
+                 double bearing = Geolocator.bearingBetween(
+                    position.latitude, position.longitude,
+                    radar['latitude'], radar['longitude']);
              double angleDiff = (bearing - position.heading).abs();
              if (angleDiff > 180) angleDiff = 360 - angleDiff;
-             if (angleDiff <= 60) {
-               if (dist < minDistRadar) minDistRadar = dist;
-             }
+             
+                 // Si le radar est bien DEVANt nous (angle de 60°) ET qu'il est sur notre route (valable à 35m près)
+                 if (angleDiff <= 60 && _isRadarOnRoute(radar['latitude'], radar['longitude'])) {
+                     if (dist < minDistRadar) {
+                       minDistRadar = dist;
+                       radarLePlusProche = LatLng(radar['latitude'], radar['longitude']);
+                     }
+                 }
           }
         }
       }
+
+      // Gestion de l'état UI et de l'onde
       setState(() {
         radarProcheDistance = minDistRadar;
       });
 
-      if (destination != null && pointsItineraire.isNotEmpty && modeNavigation) {
+      if (radarLePlusProche != null) {
+        // Déclenche l'onde sur le radar ciblé
+        _gererOndeRadar(radarLePlusProche);
+      } else {
+        // Coupe l'onde si aucun radar n'est devant nous
+        _arreterOndeRadar();
+      }
+
+      if (destination != null && pointsItineraire.isNotEmpty && modeNavigation && !_enCoursDeRecalcul) {
         // --- REAL TIME ETA / RECALCULATION ---
         double minDistanceToRoute = double.infinity;
         int minIndex = -1;
 
-        // Trouver le point le plus proche sur le tracé restant (pour performance, on chercherait mieux)
-        for (int i = 0; i < pointsItineraire.length; i++) {
-          double dist = Geolocator.distanceBetween(
+        // 1. CORRECTION : On cherche le point le plus proche sur le tracé environnant (On s'autorise à regarder 1 point en arrière pour compenser le drift)
+        int startCheck = indexRouteActuel > 0 ? indexRouteActuel - 1 : 0;
+        int endCheck = (indexRouteActuel + 10 < pointsItineraire.length) ? indexRouteActuel + 10 : pointsItineraire.length - 1;
+        
+        for (int i = startCheck; i < endCheck; i++) {
+          double dist = _distanceToSegment(
               position.latitude, position.longitude,
-              pointsItineraire[i].latitude, pointsItineraire[i].longitude);
+              pointsItineraire[i].latitude, pointsItineraire[i].longitude,
+              pointsItineraire[i+1].latitude, pointsItineraire[i+1].longitude);
           if (dist < minDistanceToRoute) {
             minDistanceToRoute = dist;
-            minIndex = i;
+            minIndex = i; // On prend le point de départ du segment
           }
         }
+        
+        // Gérer le dernier point (si on est pile à l'arrivée)
+        if (pointsItineraire.isNotEmpty && endCheck == pointsItineraire.length - 1) {
+            double distLast = Geolocator.distanceBetween(
+              position.latitude, position.longitude,
+              pointsItineraire.last.latitude, pointsItineraire.last.longitude);
+            if (distLast < minDistanceToRoute) {
+              minDistanceToRoute = distLast;
+              minIndex = pointsItineraire.length - 1;
+            }
+        }
 
-        if (minDistanceToRoute > 100) { // Déviation > 100m = recalcul route
+        // 2. CORRECTION : Tolérance assouplie à 75m pour éviter les recalculs fantômes dans les virages
+        if (minDistanceToRoute > 75) { 
              debugPrint("🚩 Déviation détectée ($minDistanceToRoute m). Recalcul de l'itinéraire !");
-             pointsItineraire.clear();
-             pointsSpeedLimit.clear();
-             segmentsTrafic.clear();
-             calculerRoute(maPosition, destination!, transportMode);
+             
+             setState(() {
+               _enCoursDeRecalcul = true; // On bloque les futurs appels
+               etaTextApercu = "Recalcul...";
+             });
+
+             // On relance le calcul de la route depuis la position actuelle
+             calculerRoute(maPosition, destination!, transportMode).then((_) {
+               setState(() {
+                 _enCoursDeRecalcul = false; // On débloque une fois terminé
+               });
+             });
+             
         } else if (minIndex != -1) {
+            // --- Assombrir la route au passage ---
+            if (minIndex > indexRouteActuel) {
+                indexRouteActuel = minIndex;
+                _updateRouteGeoJson(); // On redessine la ligne pour la griser !
+            }
+
             // Update Speed Limit Target
             double newLimit = 0.0;
             if (minIndex < pointsSpeedLimit.length) {
@@ -213,16 +247,27 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
 
             // Distance restante approximative en cumulant les segments suivants
             double distLeftMeters = 0;
+            // Commencer depuis minIndex (ma position projetée actuelle)
             for (int i = minIndex; i < pointsItineraire.length - 1; i++) {
                 distLeftMeters += Geolocator.distanceBetween(
                      pointsItineraire[i].latitude, pointsItineraire[i].longitude,
                      pointsItineraire[i+1].latitude, pointsItineraire[i+1].longitude,
                 );
             }
+            // Enlever la distance déjà parcourue sur le segment actuel
+            double distToSegmentEnd = Geolocator.distanceBetween(
+                position.latitude, position.longitude,
+                pointsItineraire[minIndex+1].latitude, pointsItineraire[minIndex+1].longitude,
+            );
+            double fullSegmentDist = Geolocator.distanceBetween(
+                pointsItineraire[minIndex].latitude, pointsItineraire[minIndex].longitude,
+                pointsItineraire[minIndex+1].latitude, pointsItineraire[minIndex+1].longitude,
+            );
+            distLeftMeters -= (fullSegmentDist - distToSegmentEnd).clamp(0.0, double.infinity);
             
-            // ETA Basé sur Vitesse Valhalla ou Standard => Moyenne 50 km/h urbain = 13.8 m/s
+            // ETA dynamique basé sur la Vitesse Temps Réel ou Moyenne Standard
             double speedMs = vitesseKmh > 0 ? position.speed : 13.8; 
-            if(speedMs < 5.0 && transportMode == 'auto') speedMs = 13.8; // default to avoid infinite ETA at stop
+            if(speedMs < 5.0 && transportMode == 'auto') speedMs = 13.8; 
             
             int secondsLeft = (distLeftMeters / speedMs).round();
             int hours = secondsLeft ~/ 3600;
@@ -233,13 +278,11 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                 ? "${(distLeftMeters / 1000).toStringAsFixed(1)} km" 
                 : "${distLeftMeters.round()} m";
 
-            if (newEta != etaTextApercu || newDist != distanceTextApercu || newLimit != vitesseLimiteCible) {
-               setState(() {
-                 etaTextApercu = newEta;
-                 distanceTextApercu = newDist; // Update Panel
-                 vitesseLimiteCible = newLimit;
-               });
-            }
+            setState(() {
+              etaTextApercu = newEta; // Forcer la mise à jour à chaque tic GPS
+              distanceTextApercu = newDist; // Update Panel textuel
+              vitesseLimiteCible = newLimit; // Update interface Vitesse Max
+            });
         }
       }
     });
@@ -340,6 +383,61 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     return byteData!.buffer.asUint8List();
   }
 
+  Future<Uint8List> _creerBulleRadar() async {
+    // 1. Charger et redimensionner l'image (90x90)
+    final ByteData data = await rootBundle.load('assets/icon-radar.jpg');
+    final Uint8List bytes = data.buffer.asUint8List();
+    final ui.Codec codec = await ui.instantiateImageCodec(bytes, targetWidth: 90, targetHeight: 90);
+    final ui.FrameInfo frameInfo = await codec.getNextFrame();
+    final ui.Image imageRadar = frameInfo.image;
+
+    // 2. Préparer le Canvas
+    final ui.PictureRecorder pictureRecorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(pictureRecorder);
+    
+    final Paint paintBulle = Paint()..color = Colors.white; 
+    final Paint paintBordure = Paint()
+      ..color = Colors.blue
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5.0; // Épaisseur du contour
+
+    // 3. Dimensions globales du Canvas
+    const double canvasWidth = 170.0;
+    const double canvasHeight = 195.0; // 170 pour le rond + 25 pour la flèche
+    
+    // 4. Centre et rayon du cercle 
+    // On réduit le rayon à 82 (au lieu de 85) pour laisser la place à la bordure !
+    const Offset center = Offset(canvasWidth / 2, 85.0);
+    const double radius = 82.0;
+
+    final Path bullePath = Path();
+    bullePath.addOval(Rect.fromCircle(center: center, radius: radius));
+
+    final Path flechePath = Path();
+    flechePath.moveTo(canvasWidth / 2 - 24, 155.0); // Base bien à l'intérieur du cercle
+    flechePath.lineTo(canvasWidth / 2, 190.0);      // Pointe de la flèche
+    flechePath.lineTo(canvasWidth / 2 + 24, 155.0); 
+    flechePath.close();
+
+    // Fusion des deux formes
+    final Path pathFinal = Path.combine(PathOperation.union, bullePath, flechePath);
+
+    // Dessiner le fond blanc PUIS le contour noir par-dessus
+    canvas.drawPath(pathFinal, paintBulle);
+    canvas.drawPath(pathFinal, paintBordure);
+
+    // 5. Placer ton icône parfaitement au centre (170 - 90) / 2 = 40
+    canvas.drawImage(imageRadar, const Offset(40.0, 40.0), Paint());
+
+    // 6. Convertir le tout en image binaire
+    final ui.Image finalImage = await pictureRecorder.endRecording().toImage(
+      canvasWidth.toInt(),
+      canvasHeight.toInt(),
+    );
+    final ByteData? finalByteData = await finalImage.toByteData(format: ui.ImageByteFormat.png);
+    return finalByteData!.buffer.asUint8List();
+  }
+
   Widget _buildBoutonItineraire(LatLng cible, String nom) {
     return Padding(
       padding: const EdgeInsets.only(top: 16.0),
@@ -385,71 +483,70 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     List<List<double>> fullCoords = pointsItineraire.map((p) => [p.longitude, p.latitude]).toList();
     features.add({
       "type": "Feature",
-      "geometry": {
-        "type": "LineString",
-        "coordinates": fullCoords
-      },
-      "properties": {
-        "color": "#FFFFFF",
-        "isBorder": true
-      }
+      "geometry": { "type": "LineString", "coordinates": fullCoords },
+      "properties": { "color": "#FFFFFF", "isBorder": true }
     });
 
-    // 2. La route principale (Bleue unie ou Multicolore selon le trafic)
-    if (segmentsTrafic.isEmpty) {
+    // 2. Partie DÉJÀ PARCOURUE (Gris foncé / Assombri)
+    if (indexRouteActuel > 0 && indexRouteActuel < pointsItineraire.length) {
+      List<List<double>> coordsParcourus = pointsItineraire
+          .sublist(0, indexRouteActuel + 1)
+          .map((p) => [p.longitude, p.latitude])
+          .toList();
       features.add({
         "type": "Feature",
-        "geometry": {
-          "type": "LineString",
-          "coordinates": fullCoords
-        },
-        "properties": {
-          "color": "#007AFF", // Bleu natif iOS
-          "isBorder": false
-        }
+        "geometry": { "type": "LineString", "coordinates": coordsParcourus },
+        "properties": { "color": "#555555", "isBorder": false } // Couleur grise
       });
-    } else {
-      for (var segment in segmentsTrafic) {
-        if (segment.startIndex >= 0 && segment.endIndex < pointsItineraire.length && segment.startIndex < segment.endIndex) {
-          List<List<double>> segCoords = pointsItineraire
-              .sublist(segment.startIndex, segment.endIndex + 1)
-              .map((p) => [p.longitude, p.latitude])
-              .toList();
-          
-          String hexColor = '#${(segment.color.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0').toUpperCase()}';
+    }
 
-          // --- C'EST ICI QU'ON DESSINE LE MORCEAU DE COULEUR ---
-          features.add({
-            "type": "Feature",
-            "geometry": {
-              "type": "LineString",
-              "coordinates": segCoords
-            },
-            "properties": {
-              "color": hexColor,
-              "isBorder": false
-            }
-          });
+    // 3. Partie RESTANTE À PARCOURIR (Trafic ou Bleu)
+    if (segmentsTrafic.isEmpty) {
+      // Trajet normal bleu (uniquement la partie devant nous)
+      if (indexRouteActuel < pointsItineraire.length) {
+        List<List<double>> coordsRestants = pointsItineraire
+            .sublist(indexRouteActuel)
+            .map((p) => [p.longitude, p.latitude])
+            .toList();
+        features.add({
+          "type": "Feature",
+          "geometry": { "type": "LineString", "coordinates": coordsRestants },
+          "properties": { "color": "#007AFF", "isBorder": false }
+        });
+      }
+    } else {
+      // Trajet avec trafic (on ne dessine que ce qui est devant nous)
+      for (var segment in segmentsTrafic) {
+        if (segment.endIndex > indexRouteActuel) {
+          int start = segment.startIndex > indexRouteActuel ? segment.startIndex : indexRouteActuel;
+          int end = segment.endIndex;
+          
+          if (start < end && start < pointsItineraire.length) {
+            List<List<double>> segCoords = pointsItineraire
+                .sublist(start, end + 1)
+                .map((p) => [p.longitude, p.latitude])
+                .toList();
+            
+            String hexColor = '#${(segment.color.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0').toUpperCase()}';
+            features.add({
+              "type": "Feature",
+              "geometry": { "type": "LineString", "coordinates": segCoords },
+              "properties": { "color": hexColor, "isBorder": false }
+            });
+          }
         }
       }
     }
 
-    // 3. --- AJOUT DU POINT D'ARRIVÉE (Une seule fois à la toute fin) ---
+    // 4. Point d'arrivée
     if (destination != null && pointsItineraire.isNotEmpty) {
       features.add({
         "type": "Feature",
-        "geometry": {
-          "type": "Point",
-          "coordinates": [destination!.longitude, destination!.latitude]
-        },
-        "properties": {
-          "isDestination": true,
-          "isBorder": false
-        }
+        "geometry": { "type": "Point", "coordinates": [destination!.longitude, destination!.latitude] },
+        "properties": { "isDestination": true, "isBorder": false }
       });
     }
 
-    // Mise à jour de la source sur la carte MapLibre
     await _mapController!.setGeoJsonSource("route-source", {
       "type": "FeatureCollection",
       "features": features
@@ -705,7 +802,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
 
         List<LatLng> result = _decodeValhallaPolyline(shape);
         List<int> speeds = List.filled(result.length, 0);
-        String prochaineInstruction = "En route"; // <--- NOUVEAU
+        String prochaineInstruction = "En route";
 
         try {
           final maneuvers = data['trip']['legs'][0]['maneuvers'] as List;
@@ -740,6 +837,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
           etaTextApercu = hours > 0
               ? "$hours h ${mins.toString().padLeft(2, '0')} min"
               : "$mins min";
+          indexRouteActuel = 0;
         });
 
         _updateRouteGeoJson();
@@ -772,6 +870,54 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     }
   }
 
+  // --- MATHEMATHIC TOOLS FOR DISTANCE TO SEGMENT ---
+  double _distanceToSegment(double pLat, double pLon, double vLat, double vLon, double wLat, double wLon) {
+      // Return minimum distance between line segment vw and point p
+      double distSquared = (vLat - wLat) * (vLat - wLat) + (vLon - wLon) * (vLon - wLon);
+      if (distSquared == 0.0) {
+          return Geolocator.distanceBetween(pLat, pLon, vLat, vLon);
+      }
+      // Consider the line extending the segment, parameterized as v + t (w - v).
+      // We find projection of point p onto the line. 
+      // It falls where t = [(p-v) . (w-v)] / |w-v|^2
+      // We clamp t from [0,1] to handle points outside the segment vw.
+      double t = ((pLat - vLat) * (wLat - vLat) + (pLon - vLon) * (wLon - vLon)) / distSquared;
+      t = t.clamp(0.0, 1.0);
+      
+      double projLat = vLat + t * (wLat - vLat);
+      double projLon = vLon + t * (wLon - vLon);
+      
+      return Geolocator.distanceBetween(pLat, pLon, projLat, projLon);
+  }
+
+  // --- MATHEMATHIC TOOL : VÉRIFIER SI UN POINT EST SUR LA ROUTE ---
+  bool _isRadarOnRoute(double radarLat, double radarLon) {
+      if (!modeNavigation || pointsItineraire.isEmpty) return false;
+
+      // On vérifie uniquement les segments restants devant nous (+ une petite sécurité arrière)
+      int startCheck = indexRouteActuel > 0 ? indexRouteActuel - 1 : 0;
+      
+      // On ne check que sur les X prochains kilomètres (environ 50 points d'itinéraire, selon la densité de Valhalla)
+      // Cela évite qu'un radar situé à l'autre bout de la ville nous capte si la route fait une boucle
+      int endCheck = (indexRouteActuel + 60 < pointsItineraire.length) 
+        ? indexRouteActuel + 60 
+        : pointsItineraire.length - 1;
+
+      for (int i = startCheck; i < endCheck; i++) {
+          double distFromRoute = _distanceToSegment(
+              radarLat, radarLon,
+              pointsItineraire[i].latitude, pointsItineraire[i].longitude,
+              pointsItineraire[i+1].latitude, pointsItineraire[i+1].longitude
+          );
+          
+          // Si le radar est mathématiquement posé à moins de 35m d'un bord de notre itinéraire
+          if (distFromRoute <= 35) {
+             return true;
+          }
+      }
+      return false;
+  }
+
   Future<void> chargerRadars() async {
     final url = Uri.parse(
       'https://gps-api.zeusmos.fr/radars?lat=${maPosition.latitude}&lon=${maPosition.longitude}&rayon_km=15',
@@ -790,26 +936,83 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
 
   void _majMarkersRadars() async {
     if (mesRadars.isNotEmpty && _mapController != null) {
-      await _mapController!.removeCircles(mesRadars);
+      await _mapController!.removeSymbols(mesRadars);
       mesRadars.clear();
     }
     if (_mapController == null) return;
 
-    List<CircleOptions> options = [];
+    // 1. Créer la bulle contenant ton image et l'envoyer à la carte
+    try {
+      Uint8List bulleRadarBytes = await _creerBulleRadar();
+      await _mapController!.addImage("radar_icon", bulleRadarBytes);
+    } catch (e) {
+      debugPrint("Erreur création bulle radar: $e");
+      return; 
+    }
+
+    List<SymbolOptions> options = [];
     List<Map<String, dynamic>> datas = [];
     
     for (var radar in mesRadarsData) {
-      options.add(CircleOptions(
+      options.add(SymbolOptions(
         geometry: LatLng(radar['latitude'], radar['longitude']),
-        circleColor: "#FF3B30",
-        circleRadius: 8.0,
-        circleStrokeColor: "#FFFFFF",
-        circleStrokeWidth: 2.0,
+        iconImage: "radar_icon",
+        iconSize: 0.8, // Taille de la bulle sur la carte (à ajuster selon tes goûts)
+        iconAnchor: "bottom", // La pointe de la bulle indique l'emplacement précis
       ));
       datas.add({'type': 'radar', 'data': radar});
     }
     
-    mesRadars = await _mapController!.addCircles(options, datas);
+    mesRadars = await _mapController!.addSymbols(options, datas);
+  }
+
+  void _gererOndeRadar(LatLng positionRadar) async {
+    // Si l'onde tourne déjà sur ce radar, on ne fait rien
+    if (_radarCibleOnde == positionRadar && _isOndeActive) return;
+
+    // Si on change de radar, on nettoie l'ancienne onde
+    _arreterOndeRadar();
+    _radarCibleOnde = positionRadar;
+    _isOndeActive = true;
+
+    // On anime le cercle (60 images par seconde environ)
+    _timerOnde = Timer.periodic(const Duration(milliseconds: 16), (timer) {
+      if (!mounted || !_isOndeActive) {
+        timer.cancel();
+        return;
+      }
+
+      _ondeRadius += 1.0;     // Vitesse de l'onde
+      _ondeOpacity -= 0.015;  // Vitesse de disparition
+
+      if (_ondeRadius > 60) { // Taille max de l'onde
+        _ondeRadius = 0.0;
+        _ondeOpacity = 1.0;
+      }
+
+      _mapController!.setGeoJsonSource("onde-source", {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [positionRadar.longitude, positionRadar.latitude]},
+            "properties": {
+               "radius": _ondeRadius,
+               "opacity": _ondeOpacity
+            }
+          }
+        ]
+      });
+    });
+  }
+
+  void _arreterOndeRadar() {
+    _timerOnde?.cancel();
+    _isOndeActive = false;
+    _radarCibleOnde = null;
+    if (_mapController != null && _estCartePrete) {
+      _mapController!.setGeoJsonSource("onde-source", {"type": "FeatureCollection", "features": []});
+    }
   }
 
   Future<void> chargerEssence() async {
@@ -1209,16 +1412,25 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
 
   @override
   Widget build(BuildContext context) {
+    final bool isDarkMode = MediaQuery.of(context).platformBrightness == Brightness.dark;
+    final String mapStyle = isDarkMode
+        ? 'https://api.maptiler.com/maps/basic-v2-dark/style.json?key=$mapTilerApiKey'
+        : 'https://api.maptiler.com/maps/basic-v2/style.json?key=$mapTilerApiKey';
+
     return Scaffold(
       body: Stack(
         children: [
           // ── CARTE 3D MAPLIBRE ──────────────────────────────────────────────
           MaplibreMap(
-            styleString: 'https://api.maptiler.com/maps/basic-v2/style.json?key=$mapTilerApiKey',
+            styleString: mapStyle,
             initialCameraPosition: CameraPosition(target: maPosition, zoom: 15.0),
             myLocationEnabled: true,
-            myLocationTrackingMode: modeNavigation ? MyLocationTrackingMode.TrackingCompass : MyLocationTrackingMode.None,
-            compassEnabled: true,
+            myLocationRenderMode: modeNavigation ? MyLocationRenderMode.GPS : MyLocationRenderMode.NORMAL, // La fameuse flèche Waze 3D !
+            // L'astuce est ici : on force explicitement le Tracking à None pendant le zoom pour éviter que le moteur natif n'interrompe l'animation !
+            myLocationTrackingMode: (modeNavigation && !_estEnCoursDeZoom) 
+                                      ? MyLocationTrackingMode.TrackingGPS 
+                                      : MyLocationTrackingMode.None,
+            compassEnabled: false,
             // Décaler le centre visuel vers le bas de l'écran (Navigation style)
             // Décaler le centre visuel vers le bas de l'écran (Navigation style) géré par un offset visuel
             onMapCreated: (MaplibreMapController controller) {
@@ -1272,7 +1484,8 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                   lineJoin: "round",
                   lineCap: "round",
                 ),
-                filter: ["==", "isBorder", true]
+                filter: ["==", "isBorder", true],
+                belowLayerId: "com.mapbox.annotations.points",
               );
               _mapController!.addLineLayer(
                 "route-source",
@@ -1283,7 +1496,8 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                   lineJoin: "round",
                   lineCap: "round",
                 ),
-                filter: ["==", "isBorder", false]
+                filter: ["==", "isBorder", false],
+                belowLayerId: "com.mapbox.annotations.points",
               );
               _mapController!.addCircleLayer(
                 "route-source",
@@ -1296,6 +1510,21 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                 ),
                 filter: ["==", "isDestination", true]
               );
+              
+              // --- CONFIG ONDE ---
+              _mapController!.addGeoJsonSource("onde-source", {"type": "FeatureCollection", "features": []});
+              _mapController!.addCircleLayer(
+                "onde-source",
+                "onde-layer",
+                CircleLayerProperties(
+                  circleColor: "#007AFF", // Bleue pour le radar
+                  circleRadius: ["get", "radius"],
+                  circleOpacity: ["get", "opacity"],
+                  circleStrokeWidth: 0.0,
+                ),
+                belowLayerId: "com.mapbox.annotations.points",
+              );
+
               _updateRouteGeoJson(); // Dessiner la route si existante
 
               chargerRadars();
@@ -1363,6 +1592,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                                               modeNavigation = false;
                                               modeApercuTrajet = false;
                                             });
+                                            _updateRouteGeoJson(); // Efface la ligne de la carte
                                           },
                                           child: Icon(
                                             Icons.close,
@@ -1724,9 +1954,9 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
           AnimatedPositioned(
             duration: const Duration(milliseconds: 400),
             curve: Curves.easeOutBack,
-            // S'il y a un radar : On le met à top: 150 s'il y a le bandeau de nav, sinon top: 60
-            top: radarProcheDistance != double.infinity 
-                  ? (modeNavigation ? 160 : 60) 
+            // Visible seulement en navigation, et si radarProcheDistance est valide
+            top: (radarProcheDistance != double.infinity && modeNavigation) 
+                  ? 160 
                   : -120, 
             left: 20,
             right: 20,
@@ -1736,31 +1966,31 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                 decoration: BoxDecoration(
                   gradient: const LinearGradient(
-                    colors: [Color(0xFFFF3B30), Color(0xFFFF453A)],
+                    colors: [Color(0xFF007AFF), Color(0xFF005CE6)],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
                   borderRadius: BorderRadius.circular(16),
                   boxShadow: [
-                    BoxShadow(color: Colors.redAccent.withValues(alpha: 0.5), blurRadius: 15, offset: const Offset(0, 6)),
+                    BoxShadow(color: Colors.blueAccent.withValues(alpha: 0.5), blurRadius: 15, offset: const Offset(0, 6)),
                   ],
                   border: Border.all(color: Colors.white.withValues(alpha: 0.2), width: 1.5),
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 36),
+                    const Icon(Icons.radar, color: Colors.white, size: 36),
                     const SizedBox(width: 12),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const Text(
-                            "Zone de Danger",
+                            "Radar",
                             style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
                           ),
                           Text(
                             radarProcheDistance != double.infinity 
-                                ? "Radar à ${radarProcheDistance.round()} m" 
+                                ? "À ${radarProcheDistance.round()} m" 
                                 : "",
                             style: const TextStyle(color: Colors.white70, fontSize: 14, fontWeight: FontWeight.w500),
                           ),
@@ -1865,9 +2095,57 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                 ],
               ),
             ),
+            
+            // ── BOUTON RECENTRER (Style Waze) ────────────
+            if (modeNavigation)
+              Positioned(
+                bottom: 160, // Même hauteur que la vitesse
+                right: 16,   // Placé à droite
+                child: GestureDetector(
+                  onTap: () {
+                    // On force la caméra à revenir sur la position actuelle en 3D
+                    // Et on réactive le suivi natif pour faire réapparaître la Flèche 3D Waze !
+                    _mapController?.animateCamera(
+                      CameraUpdate.newCameraPosition(
+                        CameraPosition(
+                          target: maPosition,
+                          zoom: vitesseKmh > 80 ? 15.5 : 18.0,
+                          tilt: 55.0,
+                          bearing: _mapController?.cameraPosition?.bearing ?? 0.0,
+                        ),
+                      ),
+                      duration: const Duration(milliseconds: 800),
+                    ).then((_) {
+                       _mapController?.updateMyLocationTrackingMode(MyLocationTrackingMode.TrackingGPS);
+                    });
+                  },
+                  child: Container(
+                    width: 55,
+                    height: 55,
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.2),
+                          blurRadius: 10,
+                          offset: const Offset(0, 5),
+                        ),
+                      ],
+                    ),
+                    child: const Center(
+                      child: Icon(
+                        Icons.near_me, // Icône de flèche GPS
+                        color: Colors.blueAccent,
+                        size: 28,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
 
-          // ── PANNEAU TRAJET BAS (Style Waze ETA) ────────────
-          if (modeNavigation && destination != null)
+            // ── PANNEAU TRAJET BAS (Style Waze ETA) ────────────
+            if (modeNavigation && destination != null)
             Positioned(
               bottom: 30,
               left: 16,
@@ -1934,6 +2212,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                               destination = null;
                               pointsItineraire = [];
                               _searchController.clear();
+                              indexRouteActuel = 0;
                             });
                             _updateRouteGeoJson();
                             _mapController?.animateCamera(
@@ -2078,13 +2357,43 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                               fontWeight: FontWeight.bold,
                             ),
                           ),
-                          onPressed: () {
+                          onPressed: () async {
+                            // 1. D'abord on indique à l'interface qu'on part en Navigation MAIS qu'on est en zoom manuel
+                            // Cela désactive le TrackingGPS natif temporairement (voir MaplibreMap -> myLocationTrackingMode)
                             setState(() {
                               modeApercuTrajet = false;
                               modeNavigation = true;
+                              _estEnCoursDeZoom = true;
                             });
-                            // Zoom et rotation immersifs
-                            _mapController?.animateCamera(CameraUpdate.newLatLngZoom(maPosition, 18.0));
+                            
+                            // 2. Un délai de 3 secondes demandé par l'utilisateur pour laisser le temps
+                            // au moteur de charger la 3D, construire la route, et fluidifier le rendu
+                            // avant que l'on donne l'ordre d'animer la caméra.
+                            await Future.delayed(const Duration(seconds: 3));
+                            
+                            // 3. On lance l'animation "vrouuum"
+                            if (_mapController != null && mounted) {
+                                await _mapController!.animateCamera(
+                                   CameraUpdate.newCameraPosition(
+                                     CameraPosition(
+                                       target: maPosition,
+                                       zoom: 18.0,
+                                       tilt: 55.0, // Inclinaison 3D Waze
+                                       bearing: _mapController!.cameraPosition?.bearing ?? 0.0,
+                                     )
+                                   ),
+                                   duration: const Duration(milliseconds: 1500)
+                                );
+                            }
+
+                            // 4. Maintentant que la caméra est à destination, on peut remettre _estEnCoursDeZoom à false.
+                            // Le prochain "rebuild" (comme il y en a un par seconde avec le GPS)
+                            // remettra le mode en TrackingGPS de façon stable sur la nouvelle position !
+                            if (mounted) {
+                               setState(() {
+                                 _estEnCoursDeZoom = false;
+                               });
+                            }
                           },
                         ),
                       ],
