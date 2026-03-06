@@ -9,7 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  flutter_map: ^8.2.2
+  maplibre_gl: ^0.16.0
   latlong2: ^0.9.0
   http: ^1.1.0
   geolocator: ^14.0.2
@@ -22,3 +22,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+  assets:
+    - assets/radar_3d.png
+    - assets/icon-radar.jpg
+    - assets/damier.jpg
