@@ -7,6 +7,7 @@ import 'package:geolocator/geolocator.dart';
 import 'dart:ui' as ui;
 import 'package:flutter/services.dart';
 import 'dart:async';
+import 'package:shared_preferences/shared_preferences.dart'; // Pour l'historique et les favoris
 
 const String tomtomApiKey = "gCm05RjVrOc3Ew1WlUgn9zrbjImAKW9n";
 const String mapTilerApiKey = "iK3uh8aiosMMylpf5nhx";
@@ -96,14 +97,112 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocus = FocusNode();
   List<dynamic> _suggestions = [];
+  
+  // --- NOUVELLE UI RECHERCHE WAZE ---
+  bool _isSearchExpanded = false;
+  String? _typeFavoriEnConfiguration;
+  List<Map<String, dynamic>> _historiqueRecherche = []; 
+  Map<String, dynamic>? _favoriDomicile; 
+  Map<String, dynamic>? _favoriTravail;
+  List<Map<String, dynamic>> _autresFavoris = [];
 
   @override
   void initState() {
     super.initState();
     _activerGPS();
-    _searchFocus.addListener(() {
-      setState(() {}); // Rebuild when focus changes
+    _chargerDonneesRecherche(); // Charger Historique et Favoris
+  }
+
+  // --- LOGIQUE SHARED PREFERENCES ---
+  Future<void> _chargerDonneesRecherche() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      // Charger Historique
+      final String? histoStr = prefs.getString('historyNavigation');
+      if (histoStr != null) {
+        List<dynamic> decoded = json.decode(histoStr);
+        _historiqueRecherche = decoded.map((e) => Map<String, dynamic>.from(e)).toList();
+      }
+      // Charger Favoris
+      final String? domStr = prefs.getString('favoriDomicile');
+      if (domStr != null) _favoriDomicile = Map<String, dynamic>.from(json.decode(domStr));
+
+      final String? tavStr = prefs.getString('favoriTravail');
+      if (tavStr != null) _favoriTravail = Map<String, dynamic>.from(json.decode(tavStr));
+      
+      final String? favStr = prefs.getString('autresFavoris');
+      if (favStr != null) {
+        List<dynamic> decoded = json.decode(favStr);
+        _autresFavoris = decoded.map((e) => Map<String, dynamic>.from(e)).toList();
+      }
     });
+  }
+
+  Future<void> _sauvegarderHistorique(Map<String, String> format, List<dynamic> coords) async {
+    final prefs = await SharedPreferences.getInstance();
+    final nouvelleEntree = {
+      "titre": format["titre"],
+      "sousTitre": format["sousTitre"],
+      "lat": coords[1],
+      "lon": coords[0],
+    };
+
+    // Éviter les doublons simples (basé sur le titre)
+    _historiqueRecherche.removeWhere((item) => item["titre"] == nouvelleEntree["titre"]);
+    
+    // Ajouter tout au-dessus
+    _historiqueRecherche.insert(0, nouvelleEntree);
+    
+    // Garder seulement les 10 derniers
+    if (_historiqueRecherche.length > 10) {
+      _historiqueRecherche = _historiqueRecherche.sublist(0, 10);
+    }
+    await prefs.setString('historyNavigation', json.encode(_historiqueRecherche));
+    setState(() {});
+  }
+
+  Future<void> _sauvegarderFavori(String type, Map<String, String> format, List<dynamic> coords) async {
+    final prefs = await SharedPreferences.getInstance();
+    final nouvelleEntree = {
+      "titre": format["titre"],
+      "sousTitre": format["sousTitre"],
+      "lat": coords[1],
+      "lon": coords[0],
+    };
+
+    if (type == 'domicile') {
+       _favoriDomicile = nouvelleEntree;
+       await prefs.setString('favoriDomicile', json.encode(_favoriDomicile));
+    } else if (type == 'travail') {
+       _favoriTravail = nouvelleEntree;
+       await prefs.setString('favoriTravail', json.encode(_favoriTravail));
+    }
+    setState(() {});
+  }
+
+  Future<void> _basculerFavoriGeneral() async {
+     if (destination == null || _searchController.text.isEmpty) return;
+     
+     final prefs = await SharedPreferences.getInstance();
+     final nom = _searchController.text;
+     
+     final index = _autresFavoris.indexWhere((fav) => fav['lat'] == destination!.latitude.toString() && fav['lon'] == destination!.longitude.toString());
+     
+     if (index >= 0) {
+        _autresFavoris.removeAt(index);
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Retiré des favoris")));
+     } else {
+        _autresFavoris.add({
+           "titre": nom,
+           "sousTitre": "Position enregistrée", // Fallback simplifié
+           "lat": destination!.latitude.toString(),
+           "lon": destination!.longitude.toString(),
+        });
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Ajouté aux favoris"), backgroundColor: Colors.green));
+     }
+     
+     await prefs.setString('autresFavoris', json.encode(_autresFavoris));
+     setState(() {});
   }
 
   @override
@@ -661,17 +760,82 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     }
   }
 
-  // --- SÉLECTION D'UNE SUGGESTION ---
-  Future<void> _selectionnerSuggestion(dynamic feature) async {
-    final coords = feature['geometry']['coordinates'];
+  // --- HELPER D'AFFICHAGE RECHERCHE ---
+  Map<String, String> _formatLieuPhoton(dynamic feature) {
     final props = feature['properties'];
-    final nom = props['name'] ?? props['city'] ?? 'Destination';
+    final name = props['name'];
+    final housenumber = props['housenumber'];
+    final street = props['street'];
+    final city = props['city'];
+    final postcode = props['postcode'];
+    final state = props['state'];
+    
+    String titre = "";
+    String sousTitre = "";
+
+    // 1. Si on a un nom (ex: "McDonald's", "Tour Eiffel")
+    if (name != null && name.isNotEmpty) {
+      titre = name;
+      // Le sous-titre devient l'adresse détaillée
+      List<String> detailsAddress = [];
+      if (housenumber != null && street != null) {
+        detailsAddress.add("$housenumber $street");
+      } else if (street != null) {
+        detailsAddress.add(street);
+      }
+      if (postcode != null && city != null) {
+        detailsAddress.add("$postcode $city");
+      } else if (city != null) {
+        detailsAddress.add(city);
+      } else if (state != null) {
+         detailsAddress.add(state);
+      }
+      sousTitre = detailsAddress.join(', ');
+    } else {
+      // 2. Pas de nom, on recherche une adresse ("34 rue de la maourine")
+      if (housenumber != null && street != null) {
+        titre = "$housenumber $street";
+        sousTitre = city != null ? "$postcode $city".trim() : (state ?? "");
+      } else if (street != null) {
+        titre = street;
+        sousTitre = city != null ? "$postcode $city".trim() : (state ?? "");
+      } else {
+        // Fallback ville simple ou truc générique
+        titre = city ?? state ?? "Lieu inconnu";
+        sousTitre = postcode ?? "";
+      }
+    }
+
+    return {"titre": titre, "sousTitre": sousTitre.isNotEmpty ? sousTitre : "France"};
+  }
+
+  // --- SÉLECTION D'UNE SUGGESTION / HISTORIQUE / FAVORI ---
+  Future<void> _selectionnerLieu(Map<String, String> format, LatLng cibleCoords, {bool isConfiguringFavorite = false, String favoriteType = ""}) async {
+    final nom = format["titre"] ?? 'Destination';
+    
     _searchController.text = nom;
     _searchFocus.unfocus();
+
     setState(() {
-      destination = LatLng(coords[1], coords[0]);
+      _isSearchExpanded = false; // Ferme la vue plein écran
       _suggestions = [];
     });
+
+    if (_typeFavoriEnConfiguration != null) {
+       // On est en train de configurer un favori "Domicile" ou "Travail"
+       await _sauvegarderFavori(_typeFavoriEnConfiguration!, format, [cibleCoords.longitude, cibleCoords.latitude]);
+       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("$nom défini comme ${_typeFavoriEnConfiguration == 'domicile' ? 'Domicile' : 'Travail'} !"), backgroundColor: Colors.green));
+       _searchController.clear();
+       _typeFavoriEnConfiguration = null;
+       return; 
+    }
+
+    setState(() {
+      destination = cibleCoords;
+    });
+
+    // Enregistre dans l'historique seulement lors d'un vrai calcul de route
+    await _sauvegarderHistorique(format, [cibleCoords.longitude, cibleCoords.latitude]);
 
     // Attendre le calcul de la route pour qu'elle s'affiche sur la carte globale
     await calculerRoute(maPosition, destination!, transportMode);
@@ -698,6 +862,13 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
            left: 50, right: 50, top: 50, bottom: 200 // Padding pour la vue UI
         ));
     }
+  }
+
+  // L'ancienne fonction qui appelle le Helper
+  Future<void> _selectionnerSuggestion(dynamic feature, {bool isConfiguringFavorite = false, String favoriteType = ""}) async {
+    final coords = feature['geometry']['coordinates'];
+    final Map<String, String> format = _formatLieuPhoton(feature);
+    await _selectionnerLieu(format, LatLng(coords[1], coords[0]), isConfiguringFavorite: isConfiguringFavorite, favoriteType: favoriteType);
   }
 
   // --- FONCTION RECHERCHE (LOOK WAZE) ---
@@ -1489,6 +1660,315 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     );
   }
 
+  // --- NOUVELLE UI: VUE RECHERCHE PLEIN ECRAN ---
+  Widget _buildFullScreenSearch(bool isDarkMode) {
+    Color bgColor = isDarkMode ? const Color(0xFF151515) : const Color(0xFFF2F2F7);
+    Color cardColor = isDarkMode ? const Color(0xFF2C2C2E) : Colors.white;
+    Color textColor = isDarkMode ? Colors.white : Colors.black87;
+    Color hintColor = isDarkMode ? Colors.white54 : Colors.black54;
+
+    return Container(
+      key: const ValueKey("FullScreenSearchUI"),
+      color: bgColor,
+      child: SafeArea(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // 1. HEADER RECHERCHE (Bouton retour + Champ Text)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                child: Row(
+                  children: [
+                    IconButton(
+                      icon: Icon(Icons.arrow_back, color: textColor),
+                      onPressed: () {
+                         _searchController.clear();
+                         _searchFocus.unfocus();
+                         setState(() {
+                            _typeFavoriEnConfiguration = null;
+                            _isSearchExpanded = false;
+                            _suggestions = [];
+                         });
+                      },
+                    ),
+                    Expanded(
+                      child: Container(
+                        height: 50,
+                        decoration: BoxDecoration(
+                          color: cardColor,
+                          borderRadius: BorderRadius.circular(12),
+                          boxShadow: isDarkMode ? [] : [BoxShadow(color: Colors.black12, blurRadius: 4, offset: const Offset(0, 2))],
+                        ),
+                        child: TextField(
+                          controller: _searchController,
+                          focusNode: _searchFocus,
+                          autofocus: true,
+                          style: TextStyle(color: textColor, fontSize: 16),
+                          decoration: InputDecoration(
+                            hintText: _typeFavoriEnConfiguration != null 
+                                ? 'Rechercher ${_typeFavoriEnConfiguration == 'domicile' ? 'Domicile' : 'Travail'}...'
+                                : 'Où allez-vous ?',
+                            hintStyle: TextStyle(color: hintColor),
+                            prefixIcon: Icon(Icons.search, color: hintColor),
+                            suffixIcon: _searchController.text.isNotEmpty 
+                               ? IconButton(
+                                   icon: Icon(Icons.close, color: hintColor),
+                                   onPressed: () {
+                                      _searchController.clear();
+                                      setState(() { _suggestions = []; });
+                                   },
+                                 )
+                               : null,
+                            border: InputBorder.none,
+                            contentPadding: const EdgeInsets.symmetric(vertical: 14),
+                          ),
+                          onChanged: (v) {
+                             _rechercherSuggestions(v);
+                          },
+                          onSubmitted: (v) {
+                             if (v.isNotEmpty) {
+                                _rechercherDestination(v);
+                             }
+                          },
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              
+              Divider(color: isDarkMode ? Colors.white10 : Colors.black12, height: 1),
+
+              // 2. CORPS DE LA RECHERCHE (Suggestions OU Historique+Favoris)
+              Expanded(
+                child: _searchController.text.isNotEmpty
+                    ? _buildResultatsRecherche(isDarkMode) // Afficher les résultats API en direct
+                    : _buildHistoriqueEtFavoris(isDarkMode), // Afficher par défaut les options locales
+              ),
+            ],
+          ),
+        ),
+      );
+  }
+
+  Widget _buildHistoriqueEtFavoris(bool isDarkMode) {
+     Color textColor = isDarkMode ? Colors.white : Colors.black87;
+     Color mutedColor = isDarkMode ? Colors.white54 : Colors.black54;
+
+     return ListView(
+        padding: const EdgeInsets.all(16.0),
+        children: [
+           // FAVORIS
+           Row(
+             children: [
+               Expanded(child: _buildBadgeFavori('domicile', 'Domicile', Icons.home, _favoriDomicile, isDarkMode)),
+               const SizedBox(width: 12),
+               Expanded(child: _buildBadgeFavori('travail', 'Travail', Icons.work, _favoriTravail, isDarkMode)),
+             ],
+           ),
+           const SizedBox(height: 24),
+           
+           // AUTRES FAVORIS GÉNÉRAUX
+           if (_autresFavoris.isNotEmpty) ...[
+              Text("Lieux favoris", style: TextStyle(color: mutedColor, fontSize: 14, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              ..._autresFavoris.map((fav) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.star, color: Colors.orangeAccent),
+                title: Text(fav["titre"]!, style: TextStyle(color: textColor, fontWeight: FontWeight.bold)),
+                subtitle: Text(fav["sousTitre"]!, style: TextStyle(color: mutedColor)),
+                onTap: () {
+                   _selectionnerLieu(
+                     {"titre": fav["titre"]!, "sousTitre": fav["sousTitre"]!}, 
+                     LatLng(double.parse(fav["lat"].toString()), double.parse(fav["lon"].toString())) 
+                   );
+                },
+                onLongPress: () {
+                   _afficherOptionsFavori(fav, 'autre');
+                },
+              )),
+              const SizedBox(height: 16),
+           ],
+
+           // HISTORIQUE
+           if (_historiqueRecherche.isNotEmpty) ...[
+              Text("Historique récent", style: TextStyle(color: mutedColor, fontSize: 14, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              ..._historiqueRecherche.map((histo) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(Icons.history, color: mutedColor),
+                title: Text(histo["titre"]!, style: TextStyle(color: textColor, fontWeight: FontWeight.bold)),
+                subtitle: Text(histo["sousTitre"]!, style: TextStyle(color: mutedColor)),
+                onTap: () {
+                   _selectionnerLieu(
+                     {"titre": histo["titre"]!, "sousTitre": histo["sousTitre"]!}, 
+                     LatLng(double.parse(histo["lat"].toString()), double.parse(histo["lon"].toString()))
+                   );
+                },
+                onLongPress: () {
+                   _afficherOptionsFavori(histo, 'historique');
+                },
+              )),
+           ]
+        ],
+     );
+  }
+
+  Widget _buildBadgeFavori(String id, String label, IconData icone, Map<String, dynamic>? data, bool isDarkMode) {
+     final badgeColor = isDarkMode ? const Color(0xFF2C2C2E) : Colors.white;
+     final borderColor = isDarkMode ? Colors.white10 : Colors.black12;
+     final textColor = isDarkMode ? Colors.white : Colors.black87;
+
+     return InkWell(
+       onTap: () {
+          if (data == null) {
+             // Lancer le mode configuration pour ce favori précis !
+             setState(() {
+                _typeFavoriEnConfiguration = id;
+                _searchController.clear();
+                _searchFocus.requestFocus();
+             });
+          } else {
+             _selectionnerLieu(
+               {"titre": data["titre"]!, "sousTitre": data["sousTitre"]!}, 
+               LatLng(double.parse(data["lat"].toString()), double.parse(data["lon"].toString()))
+             );
+          }
+       },
+       onLongPress: () {
+          if (data != null) {
+             _afficherOptionsDomicileTravail(id);
+          }
+       },
+       borderRadius: BorderRadius.circular(12),
+       child: Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+             color: badgeColor,
+             borderRadius: BorderRadius.circular(12),
+             border: Border.all(color: borderColor),
+             boxShadow: isDarkMode ? [] : [BoxShadow(color: Colors.black12, blurRadius: 4, offset: const Offset(0, 2))],
+          ),
+          child: Column(
+             children: [
+                Icon(icone, color: data != null ? Colors.blueAccent : (isDarkMode ? Colors.white54 : Colors.black54), size: 28),
+                const SizedBox(height: 8),
+                Text(label, style: TextStyle(color: textColor, fontWeight: FontWeight.bold)),
+                if (data == null)
+                  const Text("Ajouter", style: TextStyle(color: Colors.blueAccent, fontSize: 12)),
+                if (data != null)
+                  Text(data["sousTitre"].toString().split(',')[0], style: TextStyle(color: isDarkMode ? Colors.white54 : Colors.black54, fontSize: 11), overflow: TextOverflow.ellipsis),
+             ],
+          ),
+       ),
+     );
+  }
+
+  Widget _buildResultatsRecherche(bool isDarkMode) {
+    Color mutedColor = isDarkMode ? Colors.white54 : Colors.black54;
+    Color textColor = isDarkMode ? Colors.white : Colors.black87;
+
+    if (_suggestions.isEmpty) {
+      return Center(child: Text("Recherche...", style: TextStyle(color: mutedColor)));
+    }
+    return ListView.separated(
+      itemCount: _suggestions.length,
+      separatorBuilder: (_, _) => Divider(color: isDarkMode ? Colors.white10 : Colors.black12, height: 1),
+      itemBuilder: (context, index) {
+        final feature = _suggestions[index];
+        final coords = feature['geometry']['coordinates'];
+        final Map<String, String> format = _formatLieuPhoton(feature);
+        
+        return ListTile(
+          leading: const Icon(Icons.location_on, color: Colors.blueAccent),
+          title: Text(format["titre"]!, style: TextStyle(color: textColor, fontWeight: FontWeight.bold)),
+          subtitle: Text(format["sousTitre"]!, style: TextStyle(color: mutedColor)),
+          onTap: () {
+             _selectionnerLieu(format, LatLng(double.parse(coords[1].toString()), double.parse(coords[0].toString())));
+          },
+        );
+      },
+    );
+  }
+
+  void _afficherOptionsDomicileTravail(String id) {
+     final isDarkMode = MediaQuery.of(context).platformBrightness == Brightness.dark;
+     showModalBottomSheet(
+        context: context,
+        backgroundColor: isDarkMode ? const Color(0xFF1C1C1E) : Colors.white,
+        builder: (context) {
+           return SafeArea(
+             child: Wrap(
+                children: [
+                   ListTile(
+                      leading: const Icon(Icons.edit, color: Colors.blueAccent),
+                      title: Text('Modifier', style: TextStyle(color: isDarkMode ? Colors.white : Colors.black87)),
+                      onTap: () {
+                         Navigator.pop(context);
+                         setState(() {
+                            _typeFavoriEnConfiguration = id;
+                            _searchController.clear();
+                            _searchFocus.requestFocus();
+                         });
+                      },
+                   ),
+                   ListTile(
+                      leading: const Icon(Icons.delete, color: Colors.redAccent),
+                      title: Text('Supprimer', style: TextStyle(color: isDarkMode ? Colors.white : Colors.black87)),
+                      onTap: () async {
+                         Navigator.pop(context);
+                         final prefs = await SharedPreferences.getInstance();
+                         setState(() {
+                            if (id == 'domicile') {
+                               _favoriDomicile = null;
+                               prefs.remove('favoriDomicile');
+                            } else {
+                               _favoriTravail = null;
+                               prefs.remove('favoriTravail');
+                            }
+                         });
+                      },
+                   ),
+                ],
+             ),
+           );
+        }
+     );
+  }
+
+  void _afficherOptionsFavori(Map<String, dynamic> item, String type) {
+     final isDarkMode = MediaQuery.of(context).platformBrightness == Brightness.dark;
+     showModalBottomSheet(
+        context: context,
+        backgroundColor: isDarkMode ? const Color(0xFF1C1C1E) : Colors.white,
+        builder: (context) {
+           return SafeArea(
+             child: Wrap(
+                children: [
+                   ListTile(
+                      leading: const Icon(Icons.delete, color: Colors.redAccent),
+                      title: Text('Supprimer', style: TextStyle(color: isDarkMode ? Colors.white : Colors.black87)),
+                      onTap: () async {
+                         Navigator.pop(context);
+                         final prefs = await SharedPreferences.getInstance();
+                         setState(() {
+                            if (type == 'historique') {
+                               _historiqueRecherche.removeWhere((i) => i['lat'] == item['lat'] && i['lon'] == item['lon']);
+                               prefs.setString('historyNavigation', json.encode(_historiqueRecherche));
+                            } else if (type == 'autre') {
+                               _autresFavoris.removeWhere((i) => i['lat'] == item['lat'] && i['lon'] == item['lon']);
+                               prefs.setString('autresFavoris', json.encode(_autresFavoris));
+                            }
+                         });
+                      },
+                   ),
+                ],
+             ),
+           );
+        }
+     );
+  }
+
   @override
   Widget build(BuildContext context) {
     final bool isDarkMode = MediaQuery.of(context).platformBrightness == Brightness.dark;
@@ -1626,7 +2106,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
           ),
 
           // ── BARRE DE RECHERCHE + CHIPS (Cachés si mode navigation) ────────
-          if (!modeNavigation)
+          if (!modeNavigation && !_isSearchExpanded)
             Positioned(
               top: 0,
               left: 0,
@@ -1652,29 +2132,48 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                                   color: Colors.white.withValues(alpha: 0.08),
                                 ),
                               ),
-                              child: TextField(
-                                controller: _searchController,
-                                focusNode: _searchFocus,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 15,
-                                ),
-                                decoration: InputDecoration(
-                                  hintText: 'Où allez-vous ?',
-                                  hintStyle: TextStyle(
-                                    color: Colors.white.withValues(alpha: 0.4),
-                                    fontSize: 15,
-                                  ),
-                                  prefixIcon: Icon(
-                                    Icons.search,
-                                    color: Colors.white.withValues(alpha: 0.5),
-                                    size: 22,
-                                  ),
-                                  suffixIcon: _searchController.text.isNotEmpty
-                                      ? GestureDetector(
+                              child: GestureDetector(
+                                onTap: () {
+                                  setState(() {
+                                    _isSearchExpanded = true;
+                                  });
+                                  // Retarder la demande de focus pour laisser l'animation de glissement se lancer
+                                  Future.delayed(const Duration(milliseconds: 100), () {
+                                    if (mounted && _isSearchExpanded) {
+                                      _searchFocus.requestFocus();
+                                    }
+                                  });
+                                },
+                                child: Container(
+                                  color: Colors.transparent, // Pour étendre la zone de clic
+                                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                                  child: Row(
+                                    children: [
+                                      Icon(
+                                        Icons.search,
+                                        color: Colors.white.withValues(alpha: 0.5),
+                                        size: 22,
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Text(
+                                          _searchController.text.isNotEmpty 
+                                            ? _searchController.text 
+                                            : 'Où allez-vous ?',
+                                          style: TextStyle(
+                                            color: _searchController.text.isNotEmpty 
+                                                ? Colors.white 
+                                                : Colors.white.withValues(alpha: 0.4),
+                                            fontSize: 15,
+                                          ),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                      if (_searchController.text.isNotEmpty)
+                                        GestureDetector(
                                           onTap: () {
                                             _searchController.clear();
-                                            _searchFocus.unfocus();
                                             setState(() {
                                               _suggestions = [];
                                               destination = null;
@@ -1682,33 +2181,20 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                                               modeNavigation = false;
                                               modeApercuTrajet = false;
                                             });
-                                            _updateRouteGeoJson(); // Efface la ligne de la carte
+                                            _updateRouteGeoJson();
                                           },
-                                          child: Icon(
-                                            Icons.close,
-                                            color: Colors.white.withValues(
-                                              alpha: 0.5,
+                                          child: Padding(
+                                            padding: const EdgeInsets.all(8.0),
+                                            child: Icon(
+                                              Icons.close,
+                                              color: Colors.white.withValues(alpha: 0.5),
+                                              size: 20,
                                             ),
-                                            size: 20,
                                           ),
-                                        )
-                                      : null,
-                                  border: InputBorder.none,
-                                  contentPadding: const EdgeInsets.symmetric(
-                                    vertical: 14,
+                                        ),
+                                    ],
                                   ),
-                                  isDense: true,
                                 ),
-                                onChanged: (v) {
-                                  debugPrint(
-                                    '⌨️ onChanged TextField: "$v" (Focus: ${_searchFocus.hasFocus})',
-                                  );
-                                  _rechercherSuggestions(v);
-                                },
-                                onSubmitted: (v) {
-                                  debugPrint('✅ onSubmitted TextField: "$v"');
-                                  _rechercherDestination(v);
-                                },
                               ),
                             ),
                           ),
@@ -1880,108 +2366,17 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
               ),
             ),
 
-          // ── SUGGESTIONS (Positioned séparé pour éviter le clipping) ───────
-          if (!modeNavigation &&
-              _searchFocus.hasFocus &&
-              _suggestions.isNotEmpty)
-            Positioned(
-              top: 80,
-              left: 12,
-              right: 74,
-              child: SafeArea(
-                bottom: false,
-                child: Material(
-                  color: Colors.transparent,
-                  child: Container(
-                    constraints: const BoxConstraints(maxHeight: 280),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1C1C1E),
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(
-                        color: Colors.white.withValues(alpha: 0.1),
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.4),
-                          blurRadius: 16,
-                          offset: const Offset(0, 6),
-                        ),
-                      ],
-                    ),
-                    child: ListView.separated(
-                      padding: EdgeInsets.zero,
-                      shrinkWrap: true,
-                      itemCount: _suggestions.length,
-                      separatorBuilder: (_, _) => Divider(
-                        height: 1,
-                        color: Colors.white.withValues(alpha: 0.07),
-                      ),
-                      itemBuilder: (context, index) {
-                        final feature = _suggestions[index];
-                        final props = feature['properties'];
-                        final nom = props['name'] ?? '';
-                        final ville = props['city'] ?? props['state'] ?? '';
-                        final pays = props['country'] ?? '';
-                        final sousTitre = [
-                          ville,
-                          pays,
-                        ].where((s) => s.isNotEmpty).join(', ');
-                        return InkWell(
-                          onTap: () => _selectionnerSuggestion(feature),
-                          borderRadius: BorderRadius.circular(16),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 12,
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.location_on_outlined,
-                                  color: Colors.blueAccent.withValues(
-                                    alpha: 0.8,
-                                  ),
-                                  size: 18,
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        nom,
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 14,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                      if (sousTitre.isNotEmpty)
-                                        Text(
-                                          sousTitre,
-                                          style: TextStyle(
-                                            color: Colors.white.withValues(
-                                              alpha: 0.45,
-                                            ),
-                                            fontSize: 12,
-                                          ),
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ),
-              ),
-            ),
+          // ── VUE RECHERCHE PLEIN ÉCRAN (Où allez-vous ?) ────────
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeOutCubic,
+            // Si étendu, on prend tout l'écran, sinon on sort par le bas
+            top: _isSearchExpanded ? 0 : MediaQuery.of(context).size.height,
+            bottom: _isSearchExpanded ? 0 : -MediaQuery.of(context).size.height,
+            left: 0,
+            right: 0,
+            child: _buildFullScreenSearch(isDarkMode),
+          ),
 
           // ── 1. PANNEAU DIRECTIONS HAUT ────────────
           if (modeNavigation)
@@ -2383,13 +2778,35 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                     ),
                     const SizedBox(height: 24),
 
-                    // Sélecteur de mode de transport
+                    // Sélecteur de mode de transport et Bouton Favori
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                       children: [
                         _boutonTransport(Icons.directions_car, 'auto'),
                         _boutonTransport(Icons.pedal_bike, 'bicycle'),
                         _boutonTransport(Icons.directions_walk, 'pedestrian'),
+                        // --- ESPACE BOUTON AJOUTER AUX FAVORIS ---
+                        GestureDetector(
+                          onTap: _basculerFavoriGeneral,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                            decoration: BoxDecoration(
+                              color: Colors.orangeAccent.shade400.withValues(alpha: 0.1),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(color: Colors.orangeAccent.shade400.withValues(alpha: 0.5), width: 1.5),
+                            ),
+                            child: Builder(
+                               builder: (context) {
+                                  bool estDejaFavori = destination != null && _autresFavoris.any((f) => f['lat'] == destination!.latitude.toString() && f['lon'] == destination!.longitude.toString());
+                                  return Icon(
+                                    estDejaFavori ? Icons.star : Icons.star_border,
+                                    color: Colors.orangeAccent.shade400,
+                                    size: 28,
+                                  );
+                               }
+                            ),
+                          ),
+                        ),
                       ],
                     ),
                     const SizedBox(height: 24),
