@@ -7,6 +7,7 @@ import 'package:geolocator/geolocator.dart';
 import 'dart:ui' as ui;
 import 'package:flutter/services.dart';
 import 'dart:async';
+import 'dart:math' show Point;
 import 'package:shared_preferences/shared_preferences.dart'; // Pour l'historique et les favoris
 
 const String tomtomApiKey = "gCm05RjVrOc3Ew1WlUgn9zrbjImAKW9n";
@@ -49,6 +50,10 @@ class CarteScreen extends StatefulWidget {
 class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderStateMixin
   MaplibreMapController? _mapController;
   String instructionActive = "Suivez l'itinéraire";
+  String instructionDistance = ""; // Distance jusqu'à la manœuvre
+  String instructionManeuver = ""; // Le type (ex: TURN_LEFT)
+  bool isExitInstruction = false; // Vrai si on sort d'une autoroute
+  List<dynamic> activeInstructions = []; // Le tableau brut renvoyé par TomTom
   bool _estCartePrete = false; // Flag pour s'assurer que la carte est prête
   LatLng maPosition = const LatLng(43.6046, 1.4442);
   List<dynamic> mesRadarsData = [];
@@ -57,11 +62,20 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
   bool _enCoursDeRecalcul = false;
   List<LatLng> pointsItineraire = []; // La ligne bleue
   LatLng? destination; // Le point d'arrivée
+  String? destinationNom; // Le nom de la destination pour l'affichage Coyote
   bool modeNavigation = false; // Mode GPS Waze-like activé
   double vitesseKmh = 0.0; // Vitesse du véhicule
   double vitesseLimiteCible = 0.0; // Vitesse réglementée max
   List<int> pointsSpeedLimit = []; // Limitations par Shape Index
   List<TrafficSegment> segmentsTrafic = []; // Segments de couleurs calculés
+
+  // --- COYOTE ROUTES ---
+  List<Map<String, dynamic>> routesAlternatives = [];
+  int indexRouteSelectionnee = 0;
+  Timer? _timerCoyoteAutoStart; // Timer pour lancer la navigation automatiquement
+  double _coyoteAutoStartProgress = 0.0; // Progression du bouton Démarrer (0 à 1)
+  bool _isCoyoteSheetExpanded = false; //BottomSheet drag status
+  int _currentRouteRequestId = 0; // Pour éviter les retours async tardifs apres annulation
 
   // --- ONDE ---
   bool _isOndeActive = false;
@@ -210,6 +224,80 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     _searchController.dispose();
     _searchFocus.dispose();
     super.dispose();
+  }
+
+  // --- TOOL: CRÉATION BULLE WAZE ETA ---
+  Future<Uint8List?> _createBubbleImage(String text, bool isSelected, bool isDarkMode) async {
+    final ui.PictureRecorder pictureRecorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(pictureRecorder);
+    
+    final Color bgColor = isSelected ? const Color(0xFF007AFF) : (isDarkMode ? const Color(0xFF2C2C2E) : Colors.white);
+    final Color textColor = (isSelected || isDarkMode) ? Colors.white : Colors.black;
+
+    final Paint paint = Paint()..color = bgColor; 
+    final Paint shadowPaint = Paint()
+      ..color = Colors.black.withValues(alpha: 0.3)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6.0);
+    
+    // Texte principal (ex: 16 min)
+    final TextSpan spanMain = TextSpan(
+      style: TextStyle(color: textColor, fontSize: 36, fontWeight: FontWeight.bold),
+      text: text,
+    );
+    final TextPainter tpMain = TextPainter(text: spanMain, textAlign: TextAlign.center, textDirection: TextDirection.ltr);
+    tpMain.layout();
+
+    // Texte secondaire (si sélectionné)
+    TextPainter? tpSub;
+    if (isSelected) {
+       final TextSpan spanSub = TextSpan(
+         style: TextStyle(color: textColor.withValues(alpha: 0.9), fontSize: 22, fontWeight: FontWeight.w500),
+         text: "Séléctionné",
+       );
+       tpSub = TextPainter(text: spanSub, textAlign: TextAlign.center, textDirection: TextDirection.ltr);
+       tpSub.layout();
+    }
+    
+    final double paddingX = 24.0;
+    final double paddingY = 16.0;
+    final double textWidth = isSelected ? (tpMain.width > tpSub!.width ? tpMain.width : tpSub.width) : tpMain.width;
+    final double textHeight = isSelected ? (tpMain.height + tpSub!.height + 4) : tpMain.height;
+
+    final double width = textWidth + paddingX * 2;
+    final double height = textHeight + paddingY * 2;
+    final double pointerSize = 16.0; 
+
+    // Ombre
+    final RRect rrect = RRect.fromLTRBR(0, 0, width, height, const Radius.circular(16));
+    canvas.drawRRect(rrect.shift(const Offset(0, 4)), shadowPaint);
+    
+    // Corps de la bulle
+    canvas.drawRRect(rrect, paint);
+    
+    // Flèche (pointe vers le bas au centre)
+    final Path path = Path();
+    path.moveTo(width / 2 - pointerSize, height - 1); 
+    path.lineTo(width / 2, height + pointerSize);
+    path.lineTo(width / 2 + pointerSize, height - 1);
+    path.close();
+    
+    canvas.drawPath(path.shift(const Offset(0, 2)), shadowPaint); // Ombre flèche
+    canvas.drawPath(path, paint); 
+
+    // Dessin du texte
+    if (isSelected) {
+       tpMain.paint(canvas, Offset((width - tpMain.width) / 2, paddingY));
+       tpSub!.paint(canvas, Offset(paddingX + (textWidth - tpSub.width) / 2, paddingY + tpMain.height + 4));
+    } else {
+       tpMain.paint(canvas, Offset((width - tpMain.width) / 2, paddingY));
+    }
+
+    final ui.Image img = await pictureRecorder.endRecording().toImage(
+      width.toInt(),
+      (height + pointerSize + 8).toInt(),
+    );
+    final ByteData? byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+    return byteData?.buffer.asUint8List();
   }
 
   // --- TOOL : CRÉATION DE L'ARRIVÉE TYPE WAZE ---
@@ -414,7 +502,42 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
             // --- Assombrir la route au passage ---
             if (minIndex > indexRouteActuel) {
                 indexRouteActuel = minIndex;
-                _updateRouteGeoJson(); // On redessine la ligne pour la griser !
+            }
+            _updateRouteGeoJson(); // On redessine la ligne en DIRECT (Smooth 1hz update)
+
+            // --- Real-time TomTom Instructions ---
+            if (activeInstructions.isNotEmpty) {
+                for (var inst in activeInstructions) {
+                   int instIndex = inst['pointIndex'];
+                   if (instIndex > indexRouteActuel) {
+                      // C'est la prochaine instruction DEVANT nous !
+                      setState(() {
+                         instructionActive = inst['message'] ?? "Suivez la route";
+                         instructionManeuver = inst['maneuver'] ?? "";
+                         
+                         // Vrai si le JSON indique une sortie OU entrée d'autoroute + un panneau
+                         isExitInstruction = (instructionManeuver == "TAKE_EXIT" || instructionManeuver == "ENTER_MOTORWAY")
+                                              && inst.containsKey('signpostText');
+                         
+                         // Calcul la distance Vol d'oiseau (Approximative)
+                         if (instIndex < pointsItineraire.length) {
+                             double dist = Geolocator.distanceBetween(
+                                 maPosition.latitude, maPosition.longitude,
+                                 pointsItineraire[instIndex].latitude, pointsItineraire[instIndex].longitude
+                             );
+                             if (dist > 1000) {
+                                 instructionDistance = "Dans ${(dist / 1000).toStringAsFixed(1)} km";
+                             } else if (dist < 40) {
+                                 instructionDistance = "Maintenant";
+                             } else {
+                                 // Arrondi au dizaine près (ex: 142m -> 140m)
+                                 instructionDistance = "Dans ${(dist / 10).round() * 10} m";
+                             }
+                         }
+                      });
+                      break; // On ne veut analyser QUE la première instruction future
+                   }
+                }
             }
 
             // Update Speed Limit Target
@@ -443,13 +566,43 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
             );
             distLeftMeters -= (fullSegmentDist - distToSegmentEnd).clamp(0.0, double.infinity);
             
-            // ETA dynamique basé sur la Vitesse Temps Réel ou Moyenne Standard
-            double speedMs = vitesseKmh > 0 ? position.speed : 13.8; 
-            if(speedMs < 5.0 && transportMode == 'auto') speedMs = 13.8; 
+            // --- ARRIVAL AUTO-STOP (Fin de trajet) ---
+            if (distLeftMeters <= 30 && minIndex >= pointsItineraire.length - 5) {
+               debugPrint("🏁 Arrivée à destination ! Fin de l'itinéraire.");
+               setState(() {
+                  modeNavigation = false;
+                  modeApercuTrajet = false;
+                  destination = null;
+                  pointsItineraire = [];
+                  instructionActive = "Vous êtes arrivé";
+               });
+               _updateRouteGeoJson();
+               _mapController?.animateCamera(
+                 CameraUpdate.newCameraPosition(
+                    CameraPosition(target: maPosition, zoom: 15.0, tilt: 0.0, bearing: 0.0)
+                 ),
+                 duration: const Duration(milliseconds: 1000)
+               );
+               return; // On arrête le calcul d'ETA et de caméra
+            }
+
+            // ETA dynamique proportionnel basé sur le calcul initial complet de TomTom (qui inclut le trafic)
+            Map<String, dynamic> activeRoute = routesAlternatives.isNotEmpty ? routesAlternatives[indexRouteSelectionnee] : {};
+            int routeTotalSeconds = activeRoute['tempsSecondes'] ?? 1;
+            num routeTotalMetersNum = activeRoute['longueurMetres'] ?? 1;
+            double routeTotalMeters = routeTotalMetersNum == 0 ? 1.0 : routeTotalMetersNum.toDouble();
             
-            int secondsLeft = (distLeftMeters / speedMs).round();
+            double distRatio = distLeftMeters / routeTotalMeters;
+            distRatio = distRatio.clamp(0.0, 1.0); // Sécurité
+            
+            int secondsLeft = (routeTotalSeconds * distRatio).round();
             int hours = secondsLeft ~/ 3600;
-            int mins = (secondsLeft % 3600) ~/ 60;
+            int mins = ((secondsLeft % 3600) / 60).ceil(); // .ceil() évite d'afficher "0 min" alors qu'on roule encore
+            
+            if (mins == 60) {
+               hours += 1;
+               mins = 0;
+            }
 
             String newEta = hours > 0 ? "$hours h ${mins.toString().padLeft(2, '0')} min" : "$mins min";
             String newDist = distLeftMeters > 1000 
@@ -629,14 +782,28 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
           ),
           icon: const Icon(Icons.navigation, color: Colors.white),
           label: const Text("Y aller", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-          onPressed: () {
+          onPressed: () async {
             Navigator.pop(context); // Ferme la petite fenêtre du bas
             _searchController.text = nom; // Met le nom dans la barre de recherche
             setState(() {
               destination = cible;
+              destinationNom = nom;
+            });
+            await calculerRoute(maPosition, destination!, transportMode);
+            
+            if (routesAlternatives.isEmpty) {
+                if (mounted) {
+                   ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Impossible de calculer l'itinéraire via TomTom."), backgroundColor: Colors.red));
+                }
+                setState(() {
+                   destination = null;
+                });
+                return;
+            }
+
+            setState(() {
               modeApercuTrajet = true; // Ouvre le panneau "Démarrer"
             });
-            calculerRoute(maPosition, destination!, transportMode);
           },
         ),
       ),
@@ -650,19 +817,96 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     if (pointsItineraire.isEmpty) {
       await _mapController!.setGeoJsonSource("route-source", {
         "type": "FeatureCollection",
-        "features": []
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": { "type": "LineString", "coordinates": [[0.0, 0.0], [0.000001, 0.000001]] },
+            "properties": { "color": "#000000", "isBorder": false, "routeIndex": -1 } // Ligne fantôme invisible
+          }
+        ]
+      });
+      await _mapController!.setGeoJsonSource("route-eta-source", {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": { "type": "Point", "coordinates": [0.0, 0.0] },
+            "properties": { "iconImage": "none" }
+          }
+        ]
+      });
+      await _mapController!.setGeoJsonSource("route-traffic-source", {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": { "type": "LineString", "coordinates": [[0.0, 0.0], [0.000001, 0.000001]] },
+            "properties": { "traffic": "clear" }
+          }
+        ]
       });
       return;
     }
 
     List<Map<String, dynamic>> features = [];
+    List<Map<String, dynamic>> etaFeatures = [];
 
-    // 1. Ligne Blanche en Contour (Style Apple Maps)
+    // 0. ROUTES ALTERNATIVES (Couleur pâle - en arrière-plan)
+    if (!modeNavigation && routesAlternatives.length > 1) {
+        for (int i = 0; i < routesAlternatives.length; i++) {
+           List<LatLng> altPoints = routesAlternatives[i]['pointsItineraire'];
+           
+           // Ajout de l'étiquette ETA au milieu de chaque route (principale ou alternative)
+           if (altPoints.isNotEmpty) {
+               int midIndex = altPoints.length ~/ 2;
+               LatLng midPoint = altPoints[midIndex];
+               
+               String etaText = routesAlternatives[i]['etaTextApercu'];
+               String imageId = 'eta_bubble_$i';
+               bool isSelected = i == indexRouteSelectionnee;
+               final isDarkMode = WidgetsBinding.instance.platformDispatcher.platformBrightness == Brightness.dark;
+               
+               Uint8List? bytes = await _createBubbleImage(etaText, isSelected, isDarkMode);
+               if (bytes != null) {
+                  await _mapController!.addImage(imageId, bytes);
+               }
+
+               etaFeatures.add({
+                 "type": "Feature",
+                 "geometry": { "type": "Point", "coordinates": [midPoint.longitude, midPoint.latitude] },
+                 "properties": { 
+                     "iconImage": imageId, 
+                     "routeIndex": i 
+                 }
+               });
+           }
+
+           if (i == indexRouteSelectionnee) continue; // On dessine la principale par dessus ensuite
+           List<List<double>> altCoords = altPoints.map((p) => [p.longitude, p.latitude]).toList();
+           
+           // Contour bleu des alternatives (plus discret)
+           features.add({
+             "type": "Feature",
+             "geometry": { "type": "LineString", "coordinates": altCoords },
+             "properties": { "color": "#2A5298", "isBorder": true, "routeIndex": i }
+           });
+           
+           // Ligne principale pale
+           features.add({
+             "type": "Feature",
+             "geometry": { "type": "LineString", "coordinates": altCoords },
+             "properties": { "color": "#80A6D6", "isBorder": false, "routeIndex": i }
+           });
+        }
+    }
+
+    // 1. Ligne en Contour (Bordure) Route Principale
     List<List<double>> fullCoords = pointsItineraire.map((p) => [p.longitude, p.latitude]).toList();
+    final isDarkModeCore = WidgetsBinding.instance.platformDispatcher.platformBrightness == Brightness.dark;
     features.add({
       "type": "Feature",
       "geometry": { "type": "LineString", "coordinates": fullCoords },
-      "properties": { "color": "#FFFFFF", "isBorder": true }
+      "properties": { "color": isDarkModeCore ? "#1C1C1E" : "#FFFFFF", "isBorder": true, "routeIndex": indexRouteSelectionnee }
     });
 
     // 2. Partie DÉJÀ PARCOURUE (Gris foncé / Assombri)
@@ -671,6 +915,11 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
           .sublist(0, indexRouteActuel + 1)
           .map((p) => [p.longitude, p.latitude])
           .toList();
+          
+      if (modeNavigation) {
+         // Connecte fluidement la fin de la zone grise à la voiture
+         coordsParcourus.add([maPosition.longitude, maPosition.latitude]);
+      }
       features.add({
         "type": "Feature",
         "geometry": { "type": "LineString", "coordinates": coordsParcourus },
@@ -678,22 +927,26 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
       });
     }
 
-    // 3. Partie RESTANTE À PARCOURIR (Trafic ou Bleu)
-    if (segmentsTrafic.isEmpty) {
-      // Trajet normal bleu (uniquement la partie devant nous)
-      if (indexRouteActuel < pointsItineraire.length) {
-        List<List<double>> coordsRestants = pointsItineraire
-            .sublist(indexRouteActuel)
-            .map((p) => [p.longitude, p.latitude])
-            .toList();
-        features.add({
-          "type": "Feature",
-          "geometry": { "type": "LineString", "coordinates": coordsRestants },
-          "properties": { "color": "#007AFF", "isBorder": false }
-        });
+    // 3. Partie RESTANTE À PARCOURIR (Bleu de base)
+    if (indexRouteActuel < pointsItineraire.length) {
+      List<List<double>> coordsRestants = pointsItineraire
+          .sublist(indexRouteActuel)
+          .map((p) => [p.longitude, p.latitude])
+          .toList();
+          
+      if (modeNavigation && coordsRestants.isNotEmpty) {
+          // Accroche le début de la ligne bleue directement sous la voiture au lieu du dernier noeud
+          coordsRestants[0] = [maPosition.longitude, maPosition.latitude];
       }
-    } else {
-      // Trajet avec trafic (on ne dessine que ce qui est devant nous)
+      features.add({
+        "type": "Feature",
+        "geometry": { "type": "LineString", "coordinates": coordsRestants },
+        "properties": { "color": "#007AFF", "isBorder": false }
+      });
+    }
+
+    // 4. Calques de Trafic par-dessus la ligne bleue
+    if (segmentsTrafic.isNotEmpty) {
       for (var segment in segmentsTrafic) {
         if (segment.endIndex > indexRouteActuel) {
           int start = segment.startIndex > indexRouteActuel ? segment.startIndex : indexRouteActuel;
@@ -704,6 +957,11 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                 .sublist(start, end + 1)
                 .map((p) => [p.longitude, p.latitude])
                 .toList();
+                
+            if (modeNavigation && start == indexRouteActuel && segCoords.isNotEmpty) {
+               // Si on roule ACTUELLEMENT sur un bouchon, on l'accroche à la voiture
+               segCoords[0] = [maPosition.longitude, maPosition.latitude];
+            }
             
             String hexColor = '#${(segment.color.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0').toUpperCase()}';
             features.add({
@@ -716,7 +974,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
       }
     }
 
-    // 4. Point d'arrivée
+    // 5. Point d'arrivée
     if (destination != null && pointsItineraire.isNotEmpty) {
       features.add({
         "type": "Feature",
@@ -729,6 +987,53 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
       "type": "FeatureCollection",
       "features": features
     });
+
+    await _mapController!.setGeoJsonSource("route-eta-source", {
+      "type": "FeatureCollection",
+      "features": etaFeatures
+    });
+  }
+
+  void _gererClicCarteRoutes(Point<double> point, LatLng latlng) async {
+      if (modeNavigation || routesAlternatives.length <= 1) return;
+      
+      _annulerTimerCoyoteAutoStart();
+
+      try {
+          final features = await _mapController!.queryRenderedFeatures(
+              point,
+              ["route-layer-main", "route-layer-border", "route-eta-symbol"],
+              null,
+          );
+
+          if (features.isNotEmpty) {
+              var feature = features.first; // Prendre la première route sous le doigt
+              // Dans MapLibre/Mapbox gl, queryRenderedFeatures retourne un json (parfois Map)
+              // Vérifions les properties
+              // Normalement feature c'est dynamiquement typé ou Map
+              var props = feature is Map ? feature['properties'] : null; // Safety check
+              // Mapbox-gl dart package renvoie souvent des objets dont les fields sont accessibles.
+              // Parfois c'est juste un string JSON qu'il faut décoder si c'est mal parsé.
+              // En général, dans mapbox_gl, c'est directement une Map :
+              if (feature != null && feature is Map && feature.containsKey('properties')) {
+                 var p = feature['properties'];
+                 if (p != null) {
+                    var rIndex = p['routeIndex'];
+                    if (rIndex != null) {
+                        int clickedIndex = (rIndex as num).toInt();
+                        if (clickedIndex != indexRouteSelectionnee && clickedIndex < routesAlternatives.length) {
+                            setState(() {
+                               indexRouteSelectionnee = clickedIndex;
+                            });
+                            _appliquerRouteSelectionnee();
+                        }
+                    }
+                 }
+              }
+          }
+      } catch (e) {
+          debugPrint("Erreur onMapClick route: $e");
+      }
   }
 
   // --- SUGGESTIONS TEMPS RÉEL ---
@@ -740,7 +1045,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
       return;
     }
     final url = Uri.parse(
-      'https://photon.komoot.io/api/?q=${Uri.encodeComponent(texte)}&lat=${maPosition.latitude}&lon=${maPosition.longitude}&limit=5&lang=fr',
+      'https://photon.komoot.io/api/?q=${Uri.encodeComponent(texte)}&lat=${maPosition.latitude}&lon=${maPosition.longitude}&limit=5&lang=fr&location_bias_scale=1',
     );
     debugPrint('   -> Appel API: $url');
     try {
@@ -815,6 +1120,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     
     _searchController.text = nom;
     _searchFocus.unfocus();
+    FocusScope.of(context).unfocus(); // Force la fermeture complète du clavier virtuel
 
     setState(() {
       _isSearchExpanded = false; // Ferme la vue plein écran
@@ -832,6 +1138,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
 
     setState(() {
       destination = cibleCoords;
+      destinationNom = _searchController.text.isNotEmpty ? _searchController.text : "Destination";
     });
 
     // Enregistre dans l'historique seulement lors d'un vrai calcul de route
@@ -840,7 +1147,17 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     // Attendre le calcul de la route pour qu'elle s'affiche sur la carte globale
     await calculerRoute(maPosition, destination!, transportMode);
 
-    // On passe en map rotative si et seulement si l'utilisateur clique sur démarrer
+    if (routesAlternatives.isEmpty) {
+        if (mounted) {
+           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Impossible de calculer l'itinéraire."), backgroundColor: Colors.red));
+        }
+        setState(() {
+           destination = null;
+        });
+        return;
+    }
+
+    // On passe en mode aperçu si une route a été trouvée
     setState(() {
       modeApercuTrajet = true;
     });
@@ -859,7 +1176,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
         }
         _mapController!.animateCamera(CameraUpdate.newLatLngBounds(
            LatLngBounds(southwest: LatLng(minLat, minLng), northeast: LatLng(maxLat, maxLng)),
-           left: 50, right: 50, top: 50, bottom: 200 // Padding pour la vue UI
+           left: 50, right: 50, top: 100, bottom: 350 // Plus de padding UI
         ));
     }
   }
@@ -875,7 +1192,7 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
   Future<void> _rechercherDestination(String texte) async {
     if (texte.trim().isEmpty) return;
     final url = Uri.parse(
-      'https://photon.komoot.io/api/?q=${Uri.encodeComponent(texte)}&lat=${maPosition.latitude}&lon=${maPosition.longitude}&limit=1&lang=fr',
+      'https://photon.komoot.io/api/?q=${Uri.encodeComponent(texte)}&lat=${maPosition.latitude}&lon=${maPosition.longitude}&limit=1&lang=fr&location_bias_scale=1',
     );
     try {
       final reponse = await http.get(
@@ -893,209 +1210,118 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
     }
   }
 
-  // --- DECODEUR POLYLINE VALHALLA (Précision 6 décimales) ---
-  List<LatLng> _decodeValhallaPolyline(String encoded) {
-    List<LatLng> polyline = [];
-    int index = 0, len = encoded.length;
-    int lat = 0, lng = 0;
-
-    while (index < len) {
-      int b, shift = 0, result = 0;
-      do {
-        b = encoded.codeUnitAt(index++) - 63;
-        result |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      int dlat = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
-      lat += dlat;
-
-      shift = 0;
-      result = 0;
-      do {
-        b = encoded.codeUnitAt(index++) - 63;
-        result |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      int dlng = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
-      lng += dlng;
-
-      final pLat = lat / 1E6;
-      final pLng = lng / 1E6;
-      polyline.add(LatLng(pLat, pLng));
-    }
-    return polyline;
-  }
-
-  // --- APPEL API TOMTOM TRAFIC ASYNCHRONE CORRIGÉ ---
-  Future<void> _fetchTomTomTraffic(LatLng depart, LatLng arrivee) async {
-    final url = Uri.parse(
-        'https://api.tomtom.com/routing/1/calculateRoute/${depart.latitude},${depart.longitude}:${arrivee.latitude},${arrivee.longitude}/json?key=$tomtomApiKey&sectionType=traffic&traffic=true');
-    
-    try {
-      final reponse = await http.get(url);
-      if (reponse.statusCode == 200) {
-        final data = json.decode(reponse.body);
-        final routes = data['routes'];
-        if (routes == null || routes.isEmpty) return;
-        
-        final route = routes[0];
-        final sections = route['sections'] as List?;
-        final legs = route['legs'] as List?;
-        if (sections == null || legs == null || legs.isEmpty) return;
-        
-        final pointsTomTom = legs[0]['points'] as List;
-        List<TrafficSegment> newSegments = [];
-        int lastValhallaMappedIndex = 0;
-
-        for (var sec in sections) {
-          if (sec['sectionType'] == 'TRAFFIC') {
-            int startIdxTT = sec['startPointIndex'];
-            int endIdxTT = sec['endPointIndex'];
-            int magnitude = sec['magnitudeOfDelay'] ?? 0;
-            
-            // Déterminer la couleur
-            Color trafficColor = const Color(0xFF007AFF); // Bleu
-            if (magnitude >= 3) {
-              trafficColor = const Color(0xFFFF3B30); // Rouge vif
-            } else if (magnitude >= 1) {
-              trafficColor = const Color(0xFFFF9500); // Orange
-            }
-
-            if (startIdxTT < pointsTomTom.length && endIdxTT < pointsTomTom.length) {
-              double startLat = pointsTomTom[startIdxTT]['latitude'];
-              double startLon = pointsTomTom[startIdxTT]['longitude'];
-              double endLat = pointsTomTom[endIdxTT]['latitude'];
-              double endLon = pointsTomTom[endIdxTT]['longitude'];
-
-              // Recherche ultra-rapide sans limite de 500 points (Pythagore)
-              int valhallaStart = lastValhallaMappedIndex;
-              double bestDistStart = double.infinity;
-              for(int i = lastValhallaMappedIndex; i < pointsItineraire.length; i++) {
-                double dLat = startLat - pointsItineraire[i].latitude;
-                double dLon = startLon - pointsItineraire[i].longitude;
-                double distSq = (dLat * dLat) + (dLon * dLon);
-                if (distSq < bestDistStart) { bestDistStart = distSq; valhallaStart = i; }
-              }
-
-              int valhallaEnd = valhallaStart;
-              double bestDistEnd = double.infinity;
-              for(int i = valhallaStart; i < pointsItineraire.length; i++) {
-                double dLat = endLat - pointsItineraire[i].latitude;
-                double dLon = endLon - pointsItineraire[i].longitude;
-                double distSq = (dLat * dLat) + (dLon * dLon);
-                if (distSq < bestDistEnd) { bestDistEnd = distSq; valhallaEnd = i; }
-              }
-              
-              // Création propre des segments
-              if (valhallaStart > lastValhallaMappedIndex) {
-                newSegments.add(TrafficSegment(lastValhallaMappedIndex, valhallaStart, const Color(0xFF007AFF)));
-              }
-              if (valhallaEnd > valhallaStart) {
-                newSegments.add(TrafficSegment(valhallaStart, valhallaEnd, trafficColor));
-                lastValhallaMappedIndex = valhallaEnd;
-              }
-            }
-          }
-        }
-
-        // Remplir la toute fin de la route en Bleu s'il reste des points
-        if (lastValhallaMappedIndex < pointsItineraire.length - 1) {
-          newSegments.add(TrafficSegment(lastValhallaMappedIndex, pointsItineraire.length - 1, const Color(0xFF007AFF)));
-        }
-
-        if (mounted) {
-          setState(() {
-            segmentsTrafic = newSegments;
-          });
-          _updateRouteGeoJson();
-        }
-      }
-    } catch (e) {
-      debugPrint("Erreur TomTom Trafic: $e");
-    }
-  }
-
-  // --- FONCTION VALHALLA (L'ITINÉRAIRE) ---
-  Future<void> calculerRoute(
-    LatLng depart,
-    LatLng arrivee,
-    String costing,
-  ) async {
+  // --- FONCTION TOMTOM (L'ITINÉRAIRE) ---
+  Future<void> calculerRoute(LatLng depart, LatLng arrivee, String costing) async {
     setState(() {
       segmentsTrafic = [];
     });
 
+    // Adaptation du mode de transport pour TomTom
+    String modeTomTom = costing == 'auto' ? 'car' : costing;
 
-    final url = Uri.parse('https://valhalla.zeusmos.fr/route');
-    final corps = json.encode({
-      "locations": [
-        {"lat": depart.latitude, "lon": depart.longitude},
-        {"lat": arrivee.latitude, "lon": arrivee.longitude},
-      ],
-      "costing": costing,
-      "units": "kilometers",
-      "directions_options": {"language": "fr-FR"}
-    });
+    // L'URL magique TomTom : Route + Alternatives + Trafic + Instructions en 1 seul appel !
+    final url = Uri.parse(
+      'https://api.tomtom.com/routing/1/calculateRoute/'
+      '${depart.latitude},${depart.longitude}:${arrivee.latitude},${arrivee.longitude}/json'
+      '?key=$tomtomApiKey'
+      '&maxAlternatives=2'
+      '&computeBestOrder=false'
+      '&routeType=fastest'
+      '&traffic=true' // Inclus le temps de trajet avec bouchons
+      '&sectionType=traffic' // Inclus les segments de couleurs pour les bouchons !
+      '&instructionsType=text'
+      '&language=fr-FR'
+      '&travelMode=$modeTomTom'
+      '&departAt=now' // Inclus l'état EXACT du trafic à l'instant T (corrige ETA sous-estimé)
+    );
+
+    final requestId = ++_currentRouteRequestId;
 
     try {
-      final reponse = await http.post(url, body: corps);
+      final reponse = await http.get(url);
       if (reponse.statusCode == 200) {
+        // Protection Anti-Cancel: si l'utilisateur a annulé pendant la requête ou fait une nouvelle recherche, on avorte.
+        if (destination == null || !mounted || requestId != _currentRouteRequestId) return;
+
         final data = json.decode(reponse.body);
-        final shape = data['trip']['legs'][0]['shape'];
+        if (data['routes'] == null) return;
+        final routes = data['routes'] as List;
 
-        final summary = data['trip']['summary'];
-        final length = summary['length']; 
-        final timeFormatter = summary['time']; 
+        List<Map<String, dynamic>> nouvellesRoutes = [];
 
-        final hours = timeFormatter ~/ 3600;
-        final mins = (timeFormatter % 3600) ~/ 60;
+        for (var routeData in routes) {
+            final summary = routeData['summary'];
+            final lengthMeters = summary['lengthInMeters'];
+            final timeFormatter = summary['travelTimeInSeconds'];
 
-        List<LatLng> result = _decodeValhallaPolyline(shape);
-        List<int> speeds = List.filled(result.length, 0);
-        String prochaineInstruction = "En route";
+            final hours = timeFormatter ~/ 3600;
+            final mins = (timeFormatter % 3600) ~/ 60;
 
-        try {
-          final maneuvers = data['trip']['legs'][0]['maneuvers'] as List;
-          
-          // --- EXTRACTION DE LA VRAIE INSTRUCTION ---
-          if (maneuvers.length > 1) {
-            prochaineInstruction = maneuvers[1]['instruction']; 
-          } else if (maneuvers.isNotEmpty) {
-            prochaineInstruction = maneuvers[0]['instruction'];
-          }
+            // 1. Extraction des points (Pas besoin de décoder une polyline avec TomTom !)
+            final legs = routeData['legs'][0]['points'] as List;
+            List<LatLng> result = legs.map((p) => LatLng((p['latitude'] as num).toDouble(), (p['longitude'] as num).toDouble())).toList();
 
-          for(var m in maneuvers) {
-            int begin = m['begin_shape_index'] ?? 0;
-            int end = m['end_shape_index'] ?? 0;
-            dynamic spd = m['speed_limit'];
-            
-            if (spd != null && spd is num && spd > 0) {
-               for(int i = begin; i <= end; i++) {
-                 if (i < speeds.length) speeds[i] = spd.toInt();
-               }
+            // 2. Extraction du tableau complet d'instructions pour le suivi temps réel
+            String prochaineInstruction = "En route";
+            List<dynamic> tableauInstructionsText = [];
+            if (routeData['guidance'] != null && routeData['guidance']['instructions'] != null) {
+                final instructions = routeData['guidance']['instructions'] as List;
+                tableauInstructionsText = instructions;
+                if (instructions.isNotEmpty) {
+                    // L'index 0 est souvent "Partez de la rue X", l'index 1 est la vraie prochaine direction
+                    prochaineInstruction = instructions.length > 1 ? instructions[1]['message'] : instructions[0]['message'];
+                }
             }
-          }
-        } catch(e) {
-          debugPrint("Erreur Extract: $e");
+
+            // 3. Extraction MAGIQUE du trafic (Couleurs des bouchons)
+            List<TrafficSegment> segmentsTraficRoute = [];
+            if (routeData['sections'] != null) {
+                for (var sec in routeData['sections']) {
+                    if (sec['sectionType'] == 'TRAFFIC') {
+                        int startIdx = sec['startPointIndex'];
+                        int endIdx = sec['endPointIndex'];
+                        int magnitude = sec['magnitudeOfDelay'] ?? 0;
+                        
+                        Color trafficColor = const Color(0xFF007AFF); // Bleu par défaut
+                        if (magnitude >= 3) trafficColor = const Color(0xFFFF3B30); // Rouge (Bouchon fort)
+                        else if (magnitude >= 1) trafficColor = const Color(0xFFFF9500); // Orange (Ralentissement)
+                        
+                        segmentsTraficRoute.add(TrafficSegment(startIdx, endIdx, trafficColor));
+                    }
+                }
+            }
+
+            nouvellesRoutes.add({
+               "pointsItineraire": result,
+               "pointsSpeedLimit": List.filled(result.length, 0), // On met 0 par défaut pour l'instant
+               "instructionActive": prochaineInstruction,
+               "instructionsArray": tableauInstructionsText, // <-- Le tableau complet pour les directions temps réel
+               "distanceTextApercu": lengthMeters > 1000 ? "${(lengthMeters / 1000).toStringAsFixed(1)} km" : "$lengthMeters m",
+               "etaTextApercu": hours > 0 ? "$hours h ${mins.toString().padLeft(2, '0')} min" : "$mins min",
+               "tempsSecondes": timeFormatter,
+               "longueurMetres": lengthMeters, // Permet de calculer l'ETA proportionnel
+               "segmentsTrafic": segmentsTraficRoute, // On sauvegarde le trafic lié à CETTE route !
+            });
         }
+
+        if (nouvellesRoutes.isEmpty) return;
+
+        // Tri par la route la plus rapide
+        nouvellesRoutes.sort((a, b) => (a['tempsSecondes'] as num).compareTo(b['tempsSecondes'] as num));
 
         setState(() {
-          pointsItineraire = result;
-          pointsSpeedLimit = speeds;
-          instructionActive = prochaineInstruction;
-          distanceTextApercu = "${length.toStringAsFixed(1)} km";
-          etaTextApercu = hours > 0
-              ? "$hours h ${mins.toString().padLeft(2, '0')} min"
-              : "$mins min";
-          indexRouteActuel = 0;
+          routesAlternatives = nouvellesRoutes;
+          indexRouteSelectionnee = 0; 
         });
+        
+        _appliquerRouteSelectionnee();
 
-        _updateRouteGeoJson();
-
-        if (costing == 'auto') {
-          _fetchTomTomTraffic(depart, arrivee);
+        // ── BOUTON DÉMARRER AUTO (Coyote logic) ──
+        if (!modeNavigation) {
+            _lancerTimerCoyoteAutoStart();
         }
 
+        // Centrer la caméra
         if (pointsItineraire.isNotEmpty && !modeNavigation && _mapController != null) {
           double minLat = pointsItineraire.first.latitude;
           double minLng = pointsItineraire.first.longitude;
@@ -1110,14 +1336,94 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
           _mapController!.animateCamera(
              CameraUpdate.newLatLngBounds(
                  LatLngBounds(southwest: LatLng(minLat, minLng), northeast: LatLng(maxLat, maxLng)),
-                 left: 80, right: 80, top: 80, bottom: 80
+                 left: 80, right: 80, top: 80, bottom: MediaQuery.of(context).padding.bottom + 260
              )
           );
         }
       }
     } catch (e) {
-      debugPrint("Erreur Valhalla: $e");
+      debugPrint("Erreur TomTom Routing: $e");
     }
+  }
+
+  void _appliquerRouteSelectionnee() {
+      if (routesAlternatives.isEmpty || indexRouteSelectionnee >= routesAlternatives.length) return;
+      var route = routesAlternatives[indexRouteSelectionnee];
+      
+      pointsItineraire = route["pointsItineraire"];
+      pointsSpeedLimit = route["pointsSpeedLimit"];
+      instructionActive = route["instructionActive"];
+      activeInstructions = route["instructionsArray"] ?? []; // <-- Stocke les instructions
+      distanceTextApercu = route["distanceTextApercu"];
+      etaTextApercu = route["etaTextApercu"];
+      segmentsTrafic = route["segmentsTrafic"]; // NOUVEAU : Charge les bouchons instantanément !
+      
+      indexRouteActuel = 0;
+      _updateRouteGeoJson();
+  }
+
+  void _lancerTimerCoyoteAutoStart() {
+      _annulerTimerCoyoteAutoStart();
+      _coyoteAutoStartProgress = 0.0;
+      
+      const int dureeTimerMs = 10000; // Démarrage auto dans 10s
+      const int tickMs = 50;
+      int elapsedMs = 0;
+
+      _timerCoyoteAutoStart = Timer.periodic(const Duration(milliseconds: tickMs), (timer) {
+          if (!mounted) {
+             timer.cancel();
+             return;
+          }
+          setState(() {
+              elapsedMs += tickMs;
+              _coyoteAutoStartProgress = elapsedMs / dureeTimerMs;
+              if (elapsedMs >= dureeTimerMs) {
+                  timer.cancel();
+                  _demarrerNavigation();
+              }
+          });
+      });
+  }
+
+  void _annulerTimerCoyoteAutoStart() {
+      if (_timerCoyoteAutoStart != null && _timerCoyoteAutoStart!.isActive) {
+          _timerCoyoteAutoStart!.cancel();
+      }
+      _timerCoyoteAutoStart = null;
+      setState(() {
+          _coyoteAutoStartProgress = 0.0;
+      });
+  }
+
+  void _demarrerNavigation() {
+    _annulerTimerCoyoteAutoStart();
+    setState(() {
+      modeApercuTrajet = false;
+      modeNavigation = true;
+      _estEnCoursDeZoom = false; 
+    });
+    
+    _updateRouteGeoJson(); // Retire les routes alternatives et bulles
+    _mapController?.updateMyLocationTrackingMode(MyLocationTrackingMode.TrackingGPS);
+    
+    Future.delayed(const Duration(seconds: 5), () {
+        if (!mounted || _mapController == null) return;
+        
+        _mapController?.animateCamera(
+          CameraUpdate.newCameraPosition(
+            CameraPosition(
+              target: maPosition,
+              zoom: vitesseKmh < 50 ? 18.0 : 16.5,
+              tilt: 55.0,
+              bearing: _mapController?.cameraPosition?.bearing ?? 0.0,
+            ),
+          ),
+          duration: const Duration(milliseconds: 800),
+        ).then((_) {
+           _mapController?.updateMyLocationTrackingMode(MyLocationTrackingMode.TrackingGPS);
+        });
+    });
   }
 
   // --- MATHEMATHIC TOOLS FOR DISTANCE TO SEGMENT ---
@@ -1703,7 +2009,22 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                           controller: _searchController,
                           focusNode: _searchFocus,
                           autofocus: true,
+                          keyboardAppearance: Brightness.dark,
                           style: TextStyle(color: textColor, fontSize: 16),
+                          onTap: () {
+                             if (modeApercuTrajet) {
+                               setState(() {
+                                 modeApercuTrajet = false;
+                                 destination = null;
+                                 routesAlternatives.clear();
+                                 pointsItineraire.clear();
+                                 pointsSpeedLimit.clear();
+                                 segmentsTrafic.clear();
+                                 _updateRouteGeoJson();
+                                 _annulerTimerCoyoteAutoStart();
+                               });
+                             }
+                          },
                           decoration: InputDecoration(
                             hintText: _typeFavoriEnConfiguration != null 
                                 ? 'Rechercher ${_typeFavoriEnConfiguration == 'domicile' ? 'Domicile' : 'Travail'}...'
@@ -1980,19 +2301,22 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
       body: Stack(
         children: [
           // ── CARTE 3D MAPLIBRE ──────────────────────────────────────────────
-          MaplibreMap(
-            styleString: mapStyle,
-            initialCameraPosition: CameraPosition(target: maPosition, zoom: 15.0),
-            myLocationEnabled: true,
-            myLocationRenderMode: modeNavigation ? MyLocationRenderMode.GPS : MyLocationRenderMode.NORMAL, // La fameuse flèche Waze 3D !
-            // L'astuce est ici : on force explicitement le Tracking à None pendant le zoom pour éviter que le moteur natif n'interrompe l'animation !
-            myLocationTrackingMode: (modeNavigation && !_estEnCoursDeZoom) 
-                                      ? MyLocationTrackingMode.TrackingGPS 
-                                      : MyLocationTrackingMode.None,
-            compassEnabled: false,
-            // Décaler le centre visuel vers le bas de l'écran (Navigation style)
-            // Décaler le centre visuel vers le bas de l'écran (Navigation style) géré par un offset visuel
-            onMapCreated: (MaplibreMapController controller) {
+          Listener(
+            onPointerDown: (_) => _annulerTimerCoyoteAutoStart(),
+            child: MaplibreMap(
+              styleString: mapStyle,
+              initialCameraPosition: CameraPosition(target: maPosition, zoom: 15.0),
+              myLocationEnabled: true,
+              myLocationRenderMode: modeNavigation ? MyLocationRenderMode.GPS : MyLocationRenderMode.NORMAL, 
+              myLocationTrackingMode: (modeNavigation && !_estEnCoursDeZoom) 
+                                        ? MyLocationTrackingMode.TrackingGPS 
+                                        : MyLocationTrackingMode.None,
+              compassEnabled: false,
+              onMapClick: (point, latLng) {
+                 _annulerTimerCoyoteAutoStart();
+                 _gererClicCarteRoutes(point, latLng);
+              },
+              onMapCreated: (MaplibreMapController controller) {
               _mapController = controller;
               _estCartePrete = true;
               
@@ -2081,6 +2405,20 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                 filter: ["==", "isDestination", true]
               );
               
+              // --- ETIQUETTES TEMPS ROUTES (ETA BUBBLES) ---
+              _mapController!.addGeoJsonSource("route-eta-source", {"type": "FeatureCollection", "features": []});
+              _mapController!.addSymbolLayer(
+                "route-eta-source",
+                "route-eta-symbol",
+                const SymbolLayerProperties(
+                  iconImage: "{iconImage}",
+                  iconSize: 1.0, // Scaled 2x
+                  iconAllowOverlap: true,
+                  iconIgnorePlacement: false,
+                  iconAnchor: "bottom",
+                ),
+              );
+              
               // --- CONFIG ONDE ---
               _mapController!.addGeoJsonSource("onde-source", {"type": "FeatureCollection", "features": []});
               _mapController!.addCircleLayer(
@@ -2104,9 +2442,10 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
               if (afficherTourisme) chargerTourisme();
             },
           ),
+),
 
-          // ── BARRE DE RECHERCHE + CHIPS (Cachés si mode navigation) ────────
-          if (!modeNavigation && !_isSearchExpanded)
+          // ── BARRE DE RECHERCHE + CHIPS (Cachés si mode navigation ou aperçu trajet) ────────
+          if (!modeNavigation && !modeApercuTrajet && !_isSearchExpanded)
             Positioned(
               top: 0,
               left: 0,
@@ -2134,6 +2473,18 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                               ),
                               child: GestureDetector(
                                 onTap: () {
+                                  if (modeApercuTrajet) {
+                                    setState(() {
+                                      modeApercuTrajet = false;
+                                      destination = null;
+                                      routesAlternatives.clear();
+                                      pointsItineraire.clear();
+                                      pointsSpeedLimit.clear();
+                                      segmentsTrafic.clear();
+                                      _updateRouteGeoJson();
+                                      _annulerTimerCoyoteAutoStart();
+                                    });
+                                  }
                                   setState(() {
                                     _isSearchExpanded = true;
                                   });
@@ -2367,16 +2718,10 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
             ),
 
           // ── VUE RECHERCHE PLEIN ÉCRAN (Où allez-vous ?) ────────
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeOutCubic,
-            // Si étendu, on prend tout l'écran, sinon on sort par le bas
-            top: _isSearchExpanded ? 0 : MediaQuery.of(context).size.height,
-            bottom: _isSearchExpanded ? 0 : -MediaQuery.of(context).size.height,
-            left: 0,
-            right: 0,
-            child: _buildFullScreenSearch(isDarkMode),
-          ),
+          if (_isSearchExpanded)
+             Positioned.fill(
+                child: _buildFullScreenSearch(isDarkMode),
+             ),
 
           // ── 1. PANNEAU DIRECTIONS HAUT ────────────
           if (modeNavigation)
@@ -2400,30 +2745,68 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
                     ),
                     child: Row(
                       children: [
-                        Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.1),
-                            shape: BoxShape.circle,
+                        // -- Icône Direction & Flèches Waze --
+                        if (isExitInstruction)
+                          Row(
+                            children: [
+                              Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.arrow_upward_rounded, color: Colors.white.withValues(alpha: 0.3), size: 28),
+                                  const SizedBox(height: 4),
+                                  Icon(Icons.arrow_upward_rounded, color: Colors.white.withValues(alpha: 0.3), size: 28),
+                                ],
+                              ),
+                              const SizedBox(width: 8),
+                              Container(
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.2),
+                                  borderRadius: BorderRadius.circular(16),
+                                ),
+                                child: const Icon(Icons.turn_right_rounded, color: Colors.white, size: 36),
+                              ),
+                            ],
+                          )
+                        else
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.1),
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                               instructionManeuver.contains("LEFT") ? Icons.turn_left :
+                               instructionManeuver.contains("RIGHT") ? Icons.turn_right :
+                               Icons.arrow_upward_rounded,
+                               color: Colors.white,
+                               size: 32
+                            ),
                           ),
-                          child: const Icon(Icons.turn_right, color: Colors.white, size: 32),
-                        ),
+                          
                         const SizedBox(width: 16),
+                        
+                        // -- Textes --
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Text(
-                                "Prochaine direction", // Texte générique ou distance au virage (à coder plus tard)
-                                style: TextStyle(color: Colors.white70, fontSize: 16, fontWeight: FontWeight.w500),
+                              Text(
+                                instructionDistance.isNotEmpty ? instructionDistance : "Calcul en cours...",
+                                style: const TextStyle(color: Colors.white70, fontSize: 16, fontWeight: FontWeight.w500),
                               ),
                               const SizedBox(height: 4),
-                              Text(
-                                instructionActive, // <--- LA VRAIE INSTRUCTION VALHALLA
-                                style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold),
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
+                              SizedBox(
+                                width: double.infinity,
+                                child: FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    instructionActive,
+                                    style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold),
+                                  ),
+                                ),
                               ),
                             ],
                           ),
@@ -2737,213 +3120,272 @@ class _CarteScreenState extends State<CarteScreen> { // Enlevé TickerProviderSt
               ),
             ),
 
-          // ── PANNEAU APERÇU DU TRAJET (Google Maps Style) ────────────
+          // ── PANNEAU APERÇU DU TRAJET (Coyote Style) ────────────
           if (modeApercuTrajet && !modeNavigation)
             Positioned(
-              bottom: 0,
-              left: 0,
-              right: 0,
-              child: Container(
-                padding: const EdgeInsets.only(
-                  top: 20,
-                  left: 24,
-                  right: 24,
-                  bottom: 40,
-                ),
-                decoration: const BoxDecoration(
-                  color: Color(0xFF1C1C1E),
-                  borderRadius: BorderRadius.only(
-                    topLeft: Radius.circular(30),
-                    topRight: Radius.circular(30),
+              bottom: 0, left: 0, right: 0,
+              child: Align(
+                alignment: Alignment.bottomCenter,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeOutCubic,
+                  padding: EdgeInsets.only(
+                      top: 12, 
+                      left: 16, 
+                      right: 16, 
+                      bottom: MediaQuery.of(context).padding.bottom > 0 ? MediaQuery.of(context).padding.bottom + 16 : 24
                   ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black54,
-                      blurRadius: 20,
-                      offset: Offset(0, -5),
-                    ),
-                  ],
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // Pilule de drag
-                    Container(
-                      width: 40,
-                      height: 5,
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade600,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                    ),
-                    const SizedBox(height: 24),
-
-                    // Sélecteur de mode de transport et Bouton Favori
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                      children: [
-                        _boutonTransport(Icons.directions_car, 'auto'),
-                        _boutonTransport(Icons.pedal_bike, 'bicycle'),
-                        _boutonTransport(Icons.directions_walk, 'pedestrian'),
-                        // --- ESPACE BOUTON AJOUTER AUX FAVORIS ---
-                        GestureDetector(
-                          onTap: _basculerFavoriGeneral,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                            decoration: BoxDecoration(
-                              color: Colors.orangeAccent.shade400.withValues(alpha: 0.1),
-                              borderRadius: BorderRadius.circular(20),
-                              border: Border.all(color: Colors.orangeAccent.shade400.withValues(alpha: 0.5), width: 1.5),
-                            ),
-                            child: Builder(
-                               builder: (context) {
-                                  bool estDejaFavori = destination != null && _autresFavoris.any((f) => f['lat'] == destination!.latitude.toString() && f['lon'] == destination!.longitude.toString());
-                                  return Icon(
-                                    estDejaFavori ? Icons.star : Icons.star_border,
-                                    color: Colors.orangeAccent.shade400,
-                                    size: 28,
-                                  );
-                               }
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 24),
-
-                    // Informations ETA & Distance
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                  height: _isCoyoteSheetExpanded 
+                      ? 470 
+                      : 320 + MediaQuery.of(context).padding.bottom,
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF1C1C1E),
+                    borderRadius: BorderRadius.only(topLeft: Radius.circular(20), topRight: Radius.circular(20)),
+                    boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 20, offset: Offset(0, -5))],
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // LA ZONE TACTILE GLOBALE POUR LE SWIPE
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onVerticalDragUpdate: (details) {
+                           if (details.primaryDelta! < -10) {
+                              setState(() => _isCoyoteSheetExpanded = true);
+                           } else if (details.primaryDelta! > 10) {
+                              setState(() => _isCoyoteSheetExpanded = false);
+                           }
+                        },
+                        child: Column(
                           children: [
-                            Text(
-                              etaTextApercu.isNotEmpty
-                                  ? etaTextApercu
-                                  : "Calcul...",
-                              style: const TextStyle(
-                                color: Colors.greenAccent,
-                                fontSize: 32,
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              distanceTextApercu.isNotEmpty
-                                  ? "($distanceTextApercu)"
-                                  : "",
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 16,
-                                fontWeight: FontWeight.w500,
-                              ),
+                            Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.grey.shade600, borderRadius: BorderRadius.circular(10))),
+                            const SizedBox(height: 12),
+                            // EN-TÊTE DESTINATION COYOTE
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              children: [
+                                GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    _annulerTimerCoyoteAutoStart();
+                                    _currentRouteRequestId++;
+                                    setState(() {
+                                      modeApercuTrajet = false;
+                                      destination = null;
+                                      destinationNom = null;
+                                      routesAlternatives = [];
+                                      pointsItineraire = [];
+                                      activeInstructions = [];
+                                      pointsSpeedLimit = [];
+                                      segmentsTrafic = [];
+                                      instructionActive = "Suivez la route";
+                                      instructionDistance = "";
+                                    });
+                                    _updateRouteGeoJson();
+                                  },
+                                  child: const Padding(
+                                    padding: EdgeInsets.all(12.0),
+                                    child: Icon(Icons.arrow_back_ios, color: Colors.white, size: 22),
+                                  ),
+                                ),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        destinationNom ?? "Destination",
+                                        style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    _annulerTimerCoyoteAutoStart();
+                                    _currentRouteRequestId++; // Invalide toute requête en cours
+                                    setState(() {
+                                      modeApercuTrajet = false;
+                                      destination = null;
+                                      destinationNom = null;
+                                      routesAlternatives = [];
+                                      pointsItineraire = [];
+                                      activeInstructions = [];
+                                      pointsSpeedLimit = [];
+                                      segmentsTrafic = [];
+                                      instructionActive = "Suivez la route";
+                                      instructionDistance = "";
+                                    });
+                                    _updateRouteGeoJson();
+                                  },
+                                  child: const Padding(
+                                    padding: EdgeInsets.all(12.0),
+                                    child: Icon(Icons.close, color: Colors.white54, size: 28),
+                                  ),
+                                ),
+                              ],
                             ),
                           ],
                         ),
-                        // Bouton Démarrer
-                        ElevatedButton.icon(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.blueAccent.shade700,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 24,
-                              vertical: 14,
-                            ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(30),
-                            ),
-                            elevation: 8,
-                          ),
-                          icon: const Icon(Icons.navigation, size: 20),
-                          label: const Text(
-                            "Démarrer",
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          onPressed: () {
-                            // 1. Démarrage instantané du mode navigation 
-                            // ON NE BLOQUE PAS le TrackingGPS pour que la flèche apparaisse TOUT DE SUITE
-                            setState(() {
-                              modeApercuTrajet = false;
-                              modeNavigation = true;
-                              _estEnCoursDeZoom = false; // La carte passe en "TrackingGPS" direct
-                            });
-                            
-                            // 2. On raccroche de force le Tracking GPS immédiatement pour transformer le point en Flèche Waze
-                            _mapController?.updateMyLocationTrackingMode(MyLocationTrackingMode.TrackingGPS);
-                            
-                            // 3. On attend 3 secondes le temps que la carte se charge, avec la flèche affichée
-                            Future.delayed(const Duration(seconds: 5), () {
-                                if (!mounted || _mapController == null) return;
-                                
-                                // 4. On déclenche la MÊME animation swoop 3D que le bouton "Recentrer"
-                                _mapController?.animateCamera(
-                                  CameraUpdate.newCameraPosition(
-                                    CameraPosition(
-                                      target: maPosition,
-                                      zoom: vitesseKmh > 80 ? 15.5 : 18.0,
-                                      tilt: 55.0,
-                                      bearing: _mapController?.cameraPosition?.bearing ?? 0.0,
-                                    ),
-                                  ),
-                                  duration: const Duration(milliseconds: 800),
-                                ).then((_) {
-                                   // On s'assure que le tracking reste bien accroché après le zoom
-                                   _mapController?.updateMyLocationTrackingMode(MyLocationTrackingMode.TrackingGPS);
-                                });
-                            });
-                          },
-                        ),
+                      ),
+                      
+                      if (!_isCoyoteSheetExpanded && routesAlternatives.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          _buildRouteCard(routesAlternatives[indexRouteSelectionnee], indexRouteSelectionnee, true),
                       ],
-                    ),
-                  ],
+
+                      if (_isCoyoteSheetExpanded) ...[
+                          const SizedBox(height: 12),
+                          Expanded(
+                            child: ListView.builder(
+                              physics: const BouncingScrollPhysics(),
+                              itemCount: routesAlternatives.length,
+                              itemBuilder: (context, index) {
+                                return _buildRouteCard(routesAlternatives[index], index, false);
+                              },
+                            ),
+                          ),
+                      ],
+
+                      if (!_isCoyoteSheetExpanded)
+                          const Spacer(),
+                      if (_isCoyoteSheetExpanded)
+                          const SizedBox(height: 24),
+
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Stack(
+                              children: [
+                                ElevatedButton(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.blueAccent.shade700,
+                                    foregroundColor: Colors.white,
+                                    padding: const EdgeInsets.symmetric(vertical: 16),
+                                    minimumSize: const Size(double.infinity, 54),
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                                    elevation: 0,
+                                  ),
+                                  onPressed: _demarrerNavigation,
+                                  child: const Text("Démarrer", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
+                                ),
+                                if (_coyoteAutoStartProgress > 0)
+                                    Positioned.fill(
+                                      child: IgnorePointer(
+                                        child: ClipRRect(
+                                          borderRadius: BorderRadius.circular(30),
+                                          child: Align(
+                                            alignment: Alignment.centerLeft,
+                                            child: FractionallySizedBox(
+                                              widthFactor: _coyoteAutoStartProgress,
+                                              child: Container(color: Colors.black.withValues(alpha: 0.15)),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          GestureDetector(
+                            onTap: _basculerFavoriGeneral,
+                            child: Container(
+                              padding: const EdgeInsets.all(14),
+                              decoration: BoxDecoration(color: const Color(0xFF2C2C2E), shape: BoxShape.circle),
+                              child: Builder(
+                                 builder: (context) {
+                                    bool estDejaFavori = destination != null && _autresFavoris.any((f) => f['lat'] == destination!.latitude.toString() && f['lon'] == destination!.longitude.toString());
+                                    return Icon(estDejaFavori ? Icons.star : Icons.star_border, color: Colors.white54, size: 26);
+                                 }
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
-              ),
             ),
+          ),
         ],
       ),
     );
   }
 
-  // Widget pour les icônes de transport
-  Widget _boutonTransport(IconData icone, String mode) {
-    bool isSelected = (transportMode == mode);
-    return GestureDetector(
-      onTap: () {
-        if (!isSelected) {
+  // Widget de carte (Route Card) Coyote-style
+  Widget _buildRouteCard(Map<String, dynamic> route, int index, bool isCollapsed) {
+     bool isSelected = index == indexRouteSelectionnee;
+     
+     bool isFastest = true;
+     for (var r in routesAlternatives) {
+         if (r['tempsSecondes'] < route['tempsSecondes']) isFastest = false;
+     }
+
+     return GestureDetector(
+       onTap: () {
+          _annulerTimerCoyoteAutoStart();
           setState(() {
-            transportMode = mode;
-            etaTextApercu = "Calcul...";
-            distanceTextApercu = "";
+            indexRouteSelectionnee = index;
+            if (_isCoyoteSheetExpanded) _isCoyoteSheetExpanded = false; // Replie la vue
           });
-          if (destination != null) {
-            calculerRoute(maPosition, destination!, transportMode);
-          }
-        }
-      },
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-        decoration: BoxDecoration(
-          color: isSelected
-              ? Colors.blueAccent.shade700.withValues(alpha: 0.2)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: isSelected ? Colors.blueAccent.shade700 : Colors.transparent,
-            width: 2,
+          _appliquerRouteSelectionnee();
+       },
+       child: Container(
+          margin: EdgeInsets.only(bottom: isCollapsed ? 32 : 12),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+             color: isSelected ? Colors.transparent : const Color(0xFF2C2C2E),
+             border: isSelected ? Border.all(color: Colors.blueAccent.shade700, width: 2) : Border.all(color: Colors.transparent),
+             borderRadius: BorderRadius.circular(12),
           ),
-        ),
-        child: Icon(
-          icone,
-          color: isSelected ? Colors.blueAccent.shade400 : Colors.white54,
-          size: 28,
-        ),
-      ),
-    );
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+               Column(
+                 crossAxisAlignment: CrossAxisAlignment.start,
+                 children: [
+                    Text(route['etaTextApercu'], style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.white)),
+                    const SizedBox(height: 4),
+                    Text(route['distanceTextApercu'], style: const TextStyle(fontSize: 14, color: Colors.white70)),
+                    const SizedBox(height: 6),
+                    Container(
+                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                       decoration: BoxDecoration(color: const Color(0xFFD4C4FB), borderRadius: BorderRadius.circular(4)), // Couleur Coyote ZFE
+                       child: const Text("Zone à Faibles Émissions", style: TextStyle(color: Colors.black87, fontSize: 10, fontWeight: FontWeight.w600)),
+                    )
+                 ],
+               ),
+               if (isFastest)
+                  Container(
+                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                     decoration: BoxDecoration(color: Colors.blueAccent.shade700, borderRadius: BorderRadius.circular(20)),
+                     child: Row(
+                        children: [
+                           const Icon(Icons.speed, color: Colors.white, size: 16),
+                           const SizedBox(width: 4),
+                           const Text("Rapide", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12))
+                        ]
+                     )
+                  )
+               else
+                  Container(
+                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                     decoration: BoxDecoration(color: Colors.green.shade700, borderRadius: BorderRadius.circular(20)),
+                     child: Row(
+                        children: [
+                           const Icon(Icons.eco, color: Colors.white, size: 16),
+                           const SizedBox(width: 4),
+                           const Text("Eco", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12))
+                        ]
+                     )
+                  )
+            ],
+          )
+       ),
+     );
   }
 
   /// Chip de filtre style Waze (icône ronde + label)
